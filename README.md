@@ -24,13 +24,8 @@ Open a second terminal and run:
 ```bash
 ngrok http 8000
 ```
-Copy the generated HTTPS Forwarding URL (e.g., `https://xxxx-xx-xx.ngrok-free.app`).
-
-> **⚠️ Important when restarting:**  
-> Free ngrok URLs change every time you restart ngrok. Always update the URL in your Meeting BaaS dashboard:
-> 1. Go to your [Meeting BaaS Dashboard](https://meetingbaas.com) -> **Webhooks**.
-> 2. Paste: `https://<YOUR-NEW-NGROK-URL>/webhook`
-> 3. Save settings.
+> **✨ Zero-Config Auto-Discovery:**  
+> You don't need to manually copy or paste your ngrok URL anywhere! The backend automatically detects your active ngrok tunnel via the local daemon API (`http://127.0.0.1:4040/api/tunnels`) on every dispatch and registers it dynamically with the bot engine.
 
 ---
 
