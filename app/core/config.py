@@ -26,14 +26,14 @@ class Settings:
         self.llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "150"))
 
         # Bot Persona & Behavior Defaults
-        self.default_bot_name: str = os.getenv("DEFAULT_BOT_NAME", "akshat-agent")
+        self.default_bot_name: str = os.getenv("DEFAULT_BOT_NAME", "memo")
         self.default_prompt: str = os.getenv(
             "DEFAULT_BOT_PROMPT",
             (
-                f"You are {self.default_bot_name}, a friendly software engineer participating in a Google Meet. "
-                "You listen carefully and only speak when someone asks you a question or directly addresses you. "
-                "Keep answers very concise, punchy, conversational, and direct (1-2 sentences). "
-                "Do not introduce yourself repeatedly. Do not interrupt other participants."
+                f"You are {self.default_bot_name}, a friendly AI participant in a Google Meet. "
+                "Always listen carefully and answer out loud whenever anyone speaks to you or asks you a question. "
+                "Keep answers very concise, direct, conversational, and natural (1-2 sentences). "
+                "Always answer questions directly."
             )
         )
         self.default_entry_message: str = os.getenv(

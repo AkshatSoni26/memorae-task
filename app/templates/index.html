@@ -57,8 +57,8 @@
           <input 
             id="botName" 
             type="text" 
-            value="akshat-agent" 
-            class="w-full px-3.5 py-2.5 bg-slate-900/90 border border-slate-700 rounded-xl text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition text-sm"
+            value="memo" 
+            class="w-full px-3.5 py-2.5 bg-slate-900/90 border border-slate-700 rounded-xl text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition text-sm font-semibold text-indigo-300"
           />
         </div>
         <div>
@@ -68,7 +68,7 @@
           <input 
             id="entryMessage" 
             type="text" 
-            value="Hey everyone, akshat-agent here. Glad to join." 
+            value="Hey everyone, memo here. Glad to join." 
             class="w-full px-3.5 py-2.5 bg-slate-900/90 border border-slate-700 rounded-xl text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition text-sm"
           />
         </div>
@@ -184,7 +184,7 @@
         showStatusCard(activeBotId, meetUrl, data.status);
         leaveBtn.disabled = false;
         joinBtnText.innerText = "Agent in Session";
-        showAlert(`Agent '${botName || "akshat-agent"}' dispatched! Check your Google Meet tab to Admit.`);
+        showAlert(`Agent '${botName || "memo"}' dispatched! Check your Google Meet tab to Admit.`);
 
         startPolling(activeBotId);
 

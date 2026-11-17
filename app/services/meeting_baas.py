@@ -52,22 +52,13 @@ class MeetingBaaSClient:
 
         logger.info(f"🚀 Dispatching conversational agent '{bot_name}' to meeting: {cleaned_url}")
 
-        # Speaking Bots API configuration with persona, VAD turn-taking, and callback
+        # Speaking Bots API configuration - direct and standard according to Meeting BaaS docs
         payload_speaking: dict = {
             "meeting_url": cleaned_url,
             "bot_name": bot_name,
-            "personas": ["helpful_assistant"],
             "prompt": prompt,
             "entry_message": entry_message,
-            "enable_tools": False,
-            "speech_speed": 1.0,
-            "turn_config": {
-                "confidence": 0.4,       # Low VAD threshold so it clearly hears human voice
-                "start_secs": 0.1,       # Registers speech quickly
-                "stop_secs": 0.8,        # Silence pause before it checks if speaker is done
-                "min_volume": 0.02,      # Sensitive microphone volume
-                "min_interrupt_words": 1
-            }
+            "enable_tools": False
         }
 
         # Add webhook callback if provided
