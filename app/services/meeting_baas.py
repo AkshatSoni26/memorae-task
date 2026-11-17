@@ -52,13 +52,21 @@ class MeetingBaaSClient:
 
         logger.info(f"🚀 Dispatching conversational agent '{bot_name}' to meeting: {cleaned_url}")
 
-        # Speaking Bots API configuration - direct and standard according to Meeting BaaS docs
+        # Speaking Bots API configuration with Groq via OpenAI compatibility
         payload_speaking: dict = {
             "meeting_url": cleaned_url,
             "bot_name": bot_name,
             "prompt": prompt,
             "entry_message": entry_message,
-            "enable_tools": False
+            "enable_tools": False,
+            "llm_provider": "openai",
+            "llm_model": "qwen/qwen3.8-27b",
+            "extra": {
+                "openai_base_url": "https://api.groq.com/openai/v1"
+            },
+            "credentials": {
+                "llm_api_key": settings.groq_api_key
+            }
         }
 
         # Add webhook callback if provided
@@ -66,7 +74,7 @@ class MeetingBaaSClient:
             payload_speaking["callback_url"] = str(request.webhook_url)
 
         try:
-            logger.info(f"📡 Sending request to Speaking Bots API: {settings.speaking_api_url}")
+            logger.info(f"📡 Sending request to Speaking Bots API (powered by Groq): {settings.speaking_api_url}")
             resp = requests.post(
                 settings.speaking_api_url,
                 json=payload_speaking,
@@ -78,12 +86,12 @@ class MeetingBaaSClient:
                 bot_id_val = str(resp_json.get("bot_id") or resp_json.get("id") or resp_json)
                 session_store.register_bot(bot_id_val, cleaned_url, bot_name)
                 session_store.update_status(bot_id_val, "in_call")
-                logger.info(f"✅ Bot '{bot_name}' dispatched successfully via Speaking Bots API! Bot ID: {bot_id_val}")
+                logger.info(f"✅ Bot '{bot_name}' dispatched successfully via Speaking Bots API (Groq)! Bot ID: {bot_id_val}")
                 return BotResponseData(
                     bot_id=bot_id_val,
                     status=BotStatusEnum.JOINING,
                     provider_endpoint=settings.speaking_api_url,
-                    message=f"Bot '{bot_name}' successfully dispatched via Speaking Bots API."
+                    message=f"Bot '{bot_name}' successfully dispatched via Speaking Bots API (Groq)."
                 )
             else:
                 logger.warning(f"⚠️ Speaking Bots API returned status {resp.status_code}: {resp.text}")
