@@ -23,8 +23,10 @@ class VoiceSession:
         self.in_websocket: Optional[WebSocket] = None
         self.out_websocket: Optional[WebSocket] = None
         
-        # Conversation history
+        # Conversation & room context
         self.conversation_history: List[Dict[str, str]] = []
+        self.recent_room_context: List[str] = []
+        self.last_bot_spoke_at: float = 0.0
         
         # Audio state
         self.sample_rate: int = 24000
@@ -45,6 +47,14 @@ class VoiceSession:
         self.total_speech_secs: float = 0.0
 
 class GroqVoicePipelineManager:
+    # Common Whisper transcriptions of sibling bots in multi-bot Google Meets
+    OTHER_BOT_NAMES: tuple[str, ...] = ("memorae", "boardy", "bordy", "boardie")
+    BACKCHANNEL_PHRASES: frozenset[str] = frozenset({
+        "ok", "okay", "k", "thanks", "thank you", "cool", "nice", "great",
+        "got it", "yeah", "yes", "yep", "nope", "alright", "all right",
+        "uh-huh", "mm-hmm", "hmm", "right", "sure", "awesome", "perfect",
+    })
+
     def __init__(self):
         self.sessions: Dict[str, VoiceSession] = {}
         self.groq_client: Optional[AsyncGroq] = None
@@ -53,9 +63,10 @@ class GroqVoicePipelineManager:
         self.chunk_size_bytes: int = 960            # 20ms playback chunk
         self.bytes_per_second: int = 48000          # 24000 Hz * 2 bytes
         self.silence_threshold_rms: float = 300.0   # Sensitive speech detection
-        self.silence_bytes_trigger: int = 24000     # 0.50s silence triggers turn
+        self.silence_bytes_trigger: int = 36000     # 0.75s silence pause prevents mid-sentence cutoffs
         self.min_speech_bytes: int = 14400          # 0.30s min speech to avoid pops
         self.max_speech_bytes: int = 480000         # 10.0s max buffer cap
+        self.follow_up_window_secs: float = 18.0    # Follow-up window after bot replies
 
     def _get_client(self) -> AsyncGroq:
         if self.groq_client is None:
@@ -98,6 +109,37 @@ class GroqVoicePipelineManager:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned
 
+    def _evaluate_addressing(self, session: VoiceSession, user_text: str) -> tuple[bool, str]:
+        """
+        Strict explicit-address gate:
+        - ONLY responds when a participant explicitly calls this bot by its exact name.
+        - Blocks 'Memorae' / 'Memo ray' / 'Boardy' collisions.
+        - Ignores all other speech (even right after replying) and saves it as passive context.
+        """
+        text_lower = user_text.lower().strip()
+        bot_name_lower = session.bot_name.lower().strip()
+
+        if not bot_name_lower:
+            return False, "no_bot_name"
+
+        # Guard against Whisper splitting 'Memorae' into 'memo ray' / 'memo re'
+        sanitized_text = text_lower
+        if bot_name_lower == "memo":
+            sanitized_text = re.sub(r"\bmemo\s+(?:ray|re|rai|rae)\b", "memorae", sanitized_text)
+
+        # Require explicit whole-word mention of our bot's name
+        if re.search(rf"\b{re.escape(bot_name_lower)}\b", sanitized_text):
+            return True, "explicit_name"
+
+        # Detect sibling bots explicitly for clearer terminal logs
+        other_bots = [name for name in self.OTHER_BOT_NAMES if name != bot_name_lower]
+        if other_bots:
+            other_pattern = r"\b(?:" + "|".join(re.escape(n) for n in other_bots) + r")\b"
+            if re.search(other_pattern, sanitized_text):
+                return False, "other_bot_addressed"
+
+        return False, "not_explicitly_addressed"
+
     @staticmethod
     def _calculate_rms(chunk: bytes) -> float:
         if not chunk or len(chunk) < 2:
@@ -110,18 +152,20 @@ class GroqVoicePipelineManager:
         except Exception:
             return 0.0
 
-    async def speak_text(self, session: VoiceSession, text: str) -> None:
+    async def speak_text(self, session: VoiceSession, text: str) -> float:
         """
         Synthesizes text using Groq Orpheus TTS and streams 24kHz PCM packets
         into the meeting out_websocket in real-time.
+        Returns TTS synthesis latency in seconds (0.0 on failure).
         """
         if not session.out_websocket:
             logger.warning(f"⚠️ Cannot speak: out_websocket not connected for session {session.session_id}")
-            return
+            return 0.0
 
         client = self._get_client()
         logger.info(f"🔊 [Groq TTS] Synthesizing speech for: \"{text}\"")
         tts_start = time.time()
+        tts_latency = 0.0
         
         try:
             tts_resp = await client.audio.speech.create(
@@ -153,9 +197,11 @@ class GroqVoicePipelineManager:
 
             logger.info(f"⏹️ Finished audio playback for: \"{text}\"")
             print(f"⏹️ [GOOGLE MEET] Finished audio playback.", flush=True)
+            return tts_latency
         except Exception as e:
             logger.error(f"❌ Error in Groq TTS playback: {e}")
             print(f"❌ [GROQ TTS ERROR] {e}", flush=True)
+            return tts_latency
         finally:
             session.is_speaking = False
 
@@ -207,28 +253,37 @@ class GroqVoicePipelineManager:
             logger.debug(f"🔇 [Turn #{turn_num}] Ignoring blank or noise transcription.")
             return
 
-        # 3. Check trigger / relevance
-        bot_name_lower = session.bot_name.lower()
-        text_lower = user_text.lower()
-        is_addressed = (
-            bot_name_lower in text_lower
-            or "?" in user_text
-            or len(session.conversation_history) > 0  # In ongoing dialogue
-        )
+        # 3. Multi-bot safe addressing gate
+        is_addressed, gate_reason = self._evaluate_addressing(session, user_text)
 
         if not is_addressed:
-            logger.info(f"ℹ️ Speech not directed at '{session.bot_name}': \"{user_text}\"")
-            print(f"ℹ️ Speech not directed at '{session.bot_name}', skipping response.", flush=True)
+            # Passively remember last 6 overheard lines so the bot keeps meeting context
+            session.recent_room_context.append(user_text)
+            if len(session.recent_room_context) > 6:
+                session.recent_room_context = session.recent_room_context[-6:]
+
+            logger.info(f"🤫 [Turn #{turn_num}] Staying silent ({gate_reason}): \"{user_text}\"")
+            print(f"🤫 [ADDRESSING GATE] Staying silent ({gate_reason})", flush=True)
             print("=" * 60 + "\n", flush=True)
             return
 
+        logger.info(f"🎯 [Turn #{turn_num}] Addressing gate passed ({gate_reason})")
+        print(f"🎯 [ADDRESSING GATE] Engaged ({gate_reason})", flush=True)
+
         # 4. Groq LLM Generation
         llm_start = time.time()
-        messages = [
+        messages: List[Dict[str, str]] = [
             {"role": "system", "content": session.system_prompt},
-            *session.conversation_history[-8:],  # Context window
-            {"role": "user", "content": user_text}
         ]
+        # Include any recent passively overheard room context
+        if session.recent_room_context:
+            ambient_summary = " | ".join(session.recent_room_context)
+            messages.append({
+                "role": "system",
+                "content": f"Recent background meeting context you passively heard: {ambient_summary}"
+            })
+        messages.extend(session.conversation_history[-8:])
+        messages.append({"role": "user", "content": user_text})
         
         model_name = "qwen/qwen3.8-27b"
         logger.info(f"🧠 [Turn #{turn_num}] Querying Groq LLM ({model_name})...")
@@ -237,7 +292,7 @@ class GroqVoicePipelineManager:
                 model=model_name,
                 messages=messages,
                 max_tokens=120,
-                temperature=0.6
+                temperature=0.5
             )
             llm_latency = time.time() - llm_start
             raw_reply = (llm_resp.choices[0].message.content or "").strip()
@@ -253,7 +308,8 @@ class GroqVoicePipelineManager:
             logger.info(f"💡 [Turn #{turn_num}] Groq LLM reply ({llm_latency:.2f}s): \"{bot_reply}\"")
             print(f"🧠 [GROQ QWEN LLM]   {session.bot_name}: \"{bot_reply}\" ({llm_latency:.2f}s)", flush=True)
             
-            # Update history
+            # Update history and clear consumed room context
+            session.recent_room_context.clear()
             session.conversation_history.append({"role": "user", "content": user_text})
             session.conversation_history.append({"role": "assistant", "content": bot_reply})
         except Exception as llm_err:
@@ -262,14 +318,20 @@ class GroqVoicePipelineManager:
             return
 
         # 5. Groq TTS Playback
-        await self.speak_text(session, bot_reply)
+        tts_latency = await self.speak_text(session, bot_reply)
+        session.last_bot_spoke_at = time.time()
         
+        first_audio_latency = stt_latency + llm_latency + tts_latency
         total_turn_time = time.time() - turn_start
         logger.info(
-            f"⚡ [Turn #{turn_num}] Complete! Total latency: {total_turn_time:.2f}s "
-            f"(STT: {stt_latency:.2f}s, LLM: {llm_latency:.2f}s)"
+            f"⚡ [Turn #{turn_num}] Complete! First Audio: {first_audio_latency:.2f}s "
+            f"(STT: {stt_latency:.2f}s | LLM: {llm_latency:.2f}s | TTS: {tts_latency:.2f}s) | Total incl. playback: {total_turn_time:.2f}s"
         )
-        print(f"⚡ [TURN COMPLETE] Total Turnaround Latency: {total_turn_time:.2f}s", flush=True)
+        print(
+            f"⚡ [LATENCY BREAKDOWN] First Audio: {first_audio_latency:.2f}s "
+            f"(STT: {stt_latency:.2f}s | LLM: {llm_latency:.2f}s | TTS: {tts_latency:.2f}s)",
+            flush=True
+        )
         print("=" * 60 + "\n", flush=True)
 
     async def handle_audio_in(self, session: VoiceSession, websocket: WebSocket) -> None:

@@ -179,6 +179,8 @@ class MeetingBaaSClient:
             payload_groq: dict = {
                 "meeting_url": cleaned_url,
                 "bot_name": bot_name,
+                "allow_multiple_bots": True,
+                "ignored_participant_names": ["Memorae", "Boardy"],
                 "streaming_enabled": True,
                 "streaming_config": {
                     "mode": "audio",

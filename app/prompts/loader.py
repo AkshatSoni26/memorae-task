@@ -24,7 +24,7 @@ def load_system_prompt(
         if not include_silence_token:
             filtered_lines: list[str] = [
                 line for line in raw_content.splitlines()
-                if "[SILENCE]" not in line and "reply with the exact token" not in line.lower()
+                if "[SILENCE]" not in line and "exact token" not in line.lower()
             ]
             raw_content = "\n".join(filtered_lines).strip()
 
