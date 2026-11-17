@@ -19,6 +19,10 @@ class Settings:
         )
         self.speaking_api_url: str = os.getenv("SPEAKING_API_URL", "https://speaking.meetingbaas.com/bots")
         self.baas_api_url: str = os.getenv("BAAS_API_URL", "https://api.meetingbaas.com/bots")
+        self.webhook_url: str = os.getenv("WEBHOOK_URL", "")
+
+        # Groq API Configuration
+        self.groq_api_key: str = os.getenv("GROQ_API_KEY", "")
 
         # LiteLLM Model Configuration
         self.llm_model: str = os.getenv("LLM_MODEL", "groq/qwen/qwen3.8-27b")

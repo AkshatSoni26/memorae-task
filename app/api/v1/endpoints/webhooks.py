@@ -22,7 +22,8 @@ async def handle_meeting_baas_webhook(request: Request):
     except Exception:
         body_json = {}
 
-    event = body_json.get("event", "unknown")
+    header_event = request.headers.get("x-speaking-bot-event")
+    event = body_json.get("event") or header_event or "unknown"
     data = body_json.get("data", body_json)
     bot_id = data.get("bot_id") or body_json.get("bot_id", "unknown")
 
@@ -31,7 +32,7 @@ async def handle_meeting_baas_webhook(request: Request):
     print(f"📡 [EVENT]: {event.upper()} (Bot: {bot_id})")
 
     # 1. Spoken by the agent
-    if event == "speaking_bot.utterance" or "utterance" in event:
+    if "utterance" in event:
         spoken_text = data.get("text", "")
         print(f"🤖 [AGENT SPOKE]: \"{spoken_text}\"")
 

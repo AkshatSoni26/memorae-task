@@ -1,18 +1,27 @@
 import os
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from app.core.config import settings
 from app.core.logger import setup_logging
 from app.api.v1.router import api_router
 from app.api.v1.endpoints.webhooks import router as webhook_router
+from app.services.usage_monitor import start_usage_monitor
 
 # Setup application logging
 setup_logging(settings.log_level)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start live audio metrics and turn monitor
+    start_usage_monitor()
+    yield
 
 app = FastAPI(
     title="Memorae - Google Meet AI Agent",
     description="FastAPI service to deploy and control real-time conversational AI meeting participants",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 @app.get("/health", tags=["Health"])
