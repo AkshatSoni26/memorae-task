@@ -23,15 +23,17 @@ def run_cli():
         print("❌ No meeting URL provided. Exiting.")
         return
 
-    # 2. Confirm Bot Name
+    # 2. Confirm Bot Name & Pipeline
     bot_name = input(f"Agent Name [{settings.default_bot_name}]: ").strip() or settings.default_bot_name
+    pipeline_engine = input("Pipeline Engine (groq/speaking_bots) [groq]: ").strip() or "groq"
 
     # 3. Dispatch Bot
-    print(f"\n🚀 Sending '{bot_name}' to meeting: {meeting_url} ...")
+    print(f"\n🚀 Sending '{bot_name}' to meeting: {meeting_url} using pipeline '{pipeline_engine}' ...")
     try:
         req = JoinMeetingRequest(
             meeting_url=meeting_url,
-            bot_name=bot_name
+            bot_name=bot_name,
+            pipeline_provider=pipeline_engine
         )
         res = meeting_baas_service.dispatch_bot(req)
         bot_id = res.bot_id

@@ -1,4 +1,5 @@
 import requests
+import uuid
 from requests.exceptions import (
     Timeout,
     ConnectionError as ReqConnectionError,
@@ -21,7 +22,9 @@ from app.schemas.bot import (
 )
 from app.models.bot import BotStatusEnum, Participant
 from app.helpers.meeting import sanitize_meeting_url
+from app.prompts import load_system_prompt
 from app.services.session_store import session_store
+from app.services.groq_voice_pipeline import groq_voice_pipeline
 
 def get_discovered_webhook_url() -> str | None:
     """
@@ -44,7 +47,11 @@ def get_discovered_webhook_url() -> str | None:
     # 2. Dynamic auto-discovery from active local ngrok tunnel
     for host in ["127.0.0.1", "localhost"]:
         try:
-            resp = requests.get(f"http://{host}:4040/api/tunnels", timeout=1.5)
+            resp = requests.get(
+                f"http://{host}:4040/api/tunnels",
+                headers={"Host": "localhost:4040"},
+                timeout=1.5
+            )
             if resp.ok:
                 tunnels = resp.json().get("tunnels", [])
                 for tunnel in tunnels:
@@ -58,6 +65,52 @@ def get_discovered_webhook_url() -> str | None:
 
     logger.warning("⚠️ No active public webhook URL found (ngrok not running on port 4040 and WEBHOOK_URL not set).")
     return None
+
+def get_discovered_ws_url() -> str:
+    """
+    Dynamically discovers the current active public WebSocket base URL (wss://...).
+    """
+    import os
+    # 1. Environment variable override
+    env_url = (
+        os.getenv("WS_URL")
+        or os.getenv("PUBLIC_URL")
+        or os.getenv("WEBHOOK_URL")
+        or getattr(settings, "webhook_url", "")
+    )
+    if env_url and env_url.strip():
+        cleaned = env_url.strip().rstrip("/")
+        if cleaned.startswith("http://"):
+            cleaned = "ws://" + cleaned[7:]
+        elif cleaned.startswith("https://"):
+            cleaned = "wss://" + cleaned[8:]
+        elif not (cleaned.startswith("ws://") or cleaned.startswith("wss://")):
+            cleaned = f"wss://{cleaned}"
+        if cleaned.endswith("/webhook"):
+            cleaned = cleaned[:-8]
+        return cleaned
+
+    # 2. Dynamic ngrok auto-discovery
+    for host in ["127.0.0.1", "localhost"]:
+        try:
+            resp = requests.get(
+                f"http://{host}:4040/api/tunnels",
+                headers={"Host": "localhost:4040"},
+                timeout=1.5
+            )
+            if resp.ok:
+                tunnels = resp.json().get("tunnels", [])
+                for tunnel in tunnels:
+                    if tunnel.get("proto") == "https":
+                        public_url = tunnel.get("public_url", "").rstrip("/")
+                        if public_url:
+                            wss_url = public_url.replace("https://", "wss://")
+                            logger.info(f"🌐 Dynamically discovered active ngrok WSS: {wss_url}")
+                            return wss_url
+        except Exception:
+            pass
+
+    return "wss://localhost:8000"
 
 class MeetingBaaSClient:
     def __init__(self):
@@ -85,13 +138,15 @@ class MeetingBaaSClient:
         entry_message: str = clean_val(request.entry_message, settings.default_entry_message)
         recording_mode: str = clean_val(request.recording_mode, settings.default_recording_mode)
 
-        # Standard Pipecat/Speaking-Bots conversational prompt
-        system_prompt = (
-            f"You are a helpful AI participant in this meeting. Your name is {bot_name}.\n\n"
-            f"Rules:\n"
-            f"- Whenever anyone addresses you by name ({bot_name}) or asks you a question, you MUST answer verbally and out loud.\n"
-            f"- Keep your answers concise, conversational, and direct (1-2 sentences max).\n"
-            f"- Answer the user's question directly without hesitation."
+        # Load system prompt from app/prompts/system_prompt.md (or honor explicit API override)
+        custom_prompt = clean_val(request.prompt, "")
+        groq_system_prompt: str = (
+            custom_prompt if custom_prompt
+            else load_system_prompt(bot_name=bot_name, include_silence_token=True)
+        )
+        speaking_system_prompt: str = (
+            custom_prompt if custom_prompt
+            else load_system_prompt(bot_name=bot_name, include_silence_token=False)
         )
 
         logger.info(f"🚀 Dispatching conversational agent '{bot_name}' to meeting: {cleaned_url}")
@@ -102,10 +157,80 @@ class MeetingBaaSClient:
         else:
             callback_url = get_discovered_webhook_url()
 
+        pipeline_mode = (request.pipeline_provider or "groq").lower().strip()
+
+        # 1. Custom Groq Real-Time Voice Pipeline (Whisper STT + Qwen LLM + Orpheus TTS)
+        if pipeline_mode == "groq":
+            session_id = str(uuid.uuid4())
+            groq_voice_pipeline.create_session(
+                session_id=session_id,
+                bot_name=bot_name,
+                system_prompt=groq_system_prompt,
+                entry_message=entry_message
+            )
+
+            ws_base = get_discovered_ws_url()
+            output_url = f"{ws_base}/streaming/ws/audio-in/{session_id}"
+            input_url = f"{ws_base}/streaming/ws/audio-out/{session_id}"
+
+            logger.info(f"🎙️ Configured Groq Voice Pipeline WebSockets:\n   • output_url: {output_url}\n   • input_url:  {input_url}")
+
+            v2_bots_url = "https://api.meetingbaas.com/v2/bots"
+            payload_groq: dict = {
+                "meeting_url": cleaned_url,
+                "bot_name": bot_name,
+                "streaming_enabled": True,
+                "streaming_config": {
+                    "mode": "audio",
+                    "output_url": output_url,
+                    "input_url": input_url,
+                    "audio_frequency": 24000
+                }
+            }
+            if callback_url:
+                payload_groq["callback_enabled"] = True
+                payload_groq["callback_config"] = {
+                    "url": callback_url,
+                    "method": "POST"
+                }
+
+            try:
+                logger.info(f"📡 Dispatching bot via Meeting BaaS v2 with Groq pipeline: {v2_bots_url}")
+                resp = requests.post(
+                    v2_bots_url,
+                    json=payload_groq,
+                    headers=self.headers,
+                    timeout=15
+                )
+                if resp.ok:
+                    resp_json = resp.json()
+                    bot_id_val = str(
+                        resp_json.get("data", {}).get("bot_id")
+                        or resp_json.get("bot_id")
+                        or session_id
+                    )
+                    session_store.register_bot(bot_id_val, cleaned_url, bot_name)
+                    session_store.update_status(bot_id_val, "in_call")
+                    # Map bot_id to the created voice session as well
+                    groq_voice_pipeline.sessions[bot_id_val] = groq_voice_pipeline.sessions[session_id]
+                    
+                    logger.info(f"✅ Bot '{bot_name}' dispatched successfully with Groq Voice Pipeline! Bot ID: {bot_id_val}")
+                    return BotResponseData(
+                        bot_id=bot_id_val,
+                        status=BotStatusEnum.JOINING,
+                        provider_endpoint=v2_bots_url,
+                        message=f"Bot '{bot_name}' successfully dispatched with Groq Voice Pipeline (Whisper + Qwen + Orpheus)."
+                    )
+                else:
+                    logger.warning(f"⚠️ Meeting BaaS v2 streaming dispatch returned {resp.status_code}: {resp.text}")
+            except (Timeout, ReqConnectionError) as net_err:
+                logger.warning(f"⚠️ Network error dispatching Groq streaming bot, falling back: {net_err}")
+
+        # 2. Speaking Bots API (OpenAI + Deepgram + Cartesia)
         payload_speaking: dict = {
             "meeting_url": cleaned_url,
             "bot_name": bot_name,
-            "prompt": system_prompt,
+            "prompt": speaking_system_prompt,
             "personas": ["helpful_assistant"],
             "llm_provider": "openai",
             "llm_model": "gpt-4o-mini",

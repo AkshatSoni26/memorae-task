@@ -6,6 +6,7 @@ from app.core.config import settings
 from app.core.logger import setup_logging
 from app.api.v1.router import api_router
 from app.api.v1.endpoints.webhooks import router as webhook_router
+from app.api.v1.endpoints.streaming import router as streaming_router
 from app.services.usage_monitor import start_usage_monitor
 
 # Setup application logging
@@ -43,6 +44,9 @@ def serve_ui():
 
 # Mount /webhook directly at root (matches: http://<domain>/webhook)
 app.include_router(webhook_router)
+
+# Mount /streaming WebSockets directly at root (matches: ws://<domain>/streaming/ws/...)
+app.include_router(streaming_router)
 
 # Mount /api/v1 prefix
 app.include_router(api_router, prefix="/api/v1")

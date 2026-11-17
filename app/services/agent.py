@@ -2,6 +2,7 @@ from typing import List, Dict, Optional
 import litellm
 from app.core.config import settings
 from app.core.logger import logger
+from app.prompts import load_system_prompt
 
 # Suppress noisy telemetry and banner from litellm
 litellm.telemetry = False
@@ -38,7 +39,7 @@ class AgentBrainService:
         Calls LiteLLM to generate an intelligent conversational response.
         Works seamlessly with groq/..., openai/..., anthropic/..., gemini/..., etc.
         """
-        system_prompt = custom_system_prompt or settings.default_prompt
+        system_prompt = custom_system_prompt or load_system_prompt()
         model_name = custom_model or self.model
         messages = [{"role": "system", "content": system_prompt}] + transcript_history
 

@@ -30,6 +30,11 @@ class JoinMeetingRequest(BaseModel):
         default=None,
         description="Webhook URL for meeting callbacks (optional)"
     )
+    pipeline_provider: Optional[str] = Field(
+        default="groq",
+        description="Voice pipeline engine: 'groq' (Groq Whisper + Qwen + Orpheus) or 'speaking_bots'",
+        examples=["groq", "speaking_bots"]
+    )
 
     model_config = {
         "json_schema_extra": {
