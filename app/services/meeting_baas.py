@@ -154,8 +154,8 @@ class MeetingBaaSClient:
                 res = resp.json()
                 raw_data = res.get("data", res)
                 current_status = raw_data.get("status", current_status)
-        except Exception:
-            pass
+        except (Timeout, ReqConnectionError, RequestException) as net_err:
+            logger.debug(f"Upstream status check skipped/unavailable: {net_err}")
 
         status_data = BotStatusData(
             bot_id=bot_id,
@@ -192,8 +192,8 @@ class MeetingBaaSClient:
                 )
             else:
                 logger.warning(f"Speaking Bots delete status {resp.status_code}: {resp.text}")
-        except Exception as e:
-            logger.warning(f"Speaking Bots delete failed, trying fallback: {e}")
+        except (Timeout, ReqConnectionError, RequestException) as net_err:
+            logger.warning(f"Speaking Bots delete network issue, trying fallback: {net_err}")
 
         # 2. Fallback to standard baas API
         url = f"{settings.baas_api_url}/{bot_id}"
