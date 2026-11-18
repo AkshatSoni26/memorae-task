@@ -107,6 +107,12 @@ class SessionStore:
             session["status"] = app_status
         return session["status"]
 
+    def adopt_bot(self, bot_id: str, engine: str) -> dict:
+        """Tracks a bot this process didn't dispatch (e.g. after a server restart mid-call)."""
+        session = self._sessions.setdefault(bot_id, {"bot_id": bot_id, "status": "joining"})
+        session.setdefault("engine", engine)
+        return session
+
     def get_bot(self, bot_id: str) -> Optional[dict]:
         return self._sessions.get(bot_id)
 

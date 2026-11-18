@@ -30,7 +30,11 @@ class Settings:
         self.llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "150"))
 
         # Bot Persona & Behavior Defaults
-        self.default_bot_name: str = os.getenv("DEFAULT_BOT_NAME", "memo")
+        self.default_bot_name: str = os.getenv("DEFAULT_BOT_NAME", "Jarvis")
+        # Extra comma-separated spellings Whisper produces for the bot name (e.g. "nemo,memoh")
+        self.bot_name_aliases: str = os.getenv("BOT_NAME_ALIASES", "")
+        # Extra comma-separated display-name keywords of OTHER AI agents in the call (never answered)
+        self.other_ai_participants: str = os.getenv("OTHER_AI_PARTICIPANTS", "")
         self.default_prompt: str = os.getenv(
             "DEFAULT_BOT_PROMPT",
             (

@@ -331,7 +331,8 @@ class MeetingBaaSClient:
         self._ensure_api_key()
         cached = session_store.get_bot(bot_id)
         if cached is None:
-            raise BotNotFoundError(bot_id)
+            # Unknown locally (e.g. server restarted mid-call): adopt it as a v2 bot and ask upstream.
+            cached = session_store.adopt_bot(bot_id, engine="groq")
 
         if cached.get("engine") == "groq" and cached.get("status") not in ("ended", "failed"):
             url = f"{MEETING_BAAS_V2_BOTS_URL}/{bot_id}/status"

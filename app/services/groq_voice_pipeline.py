@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import os
 import re
 import struct
@@ -50,6 +51,18 @@ class VoiceSession:
         self.bot_id: Optional[str] = None
         self.greeted: bool = False
 
+        # Speaker attribution from Meeting BaaS speaker events
+        self.active_speaker: Optional[str] = None   # last human Meet reported as speaking
+        self.segment_speaker: Optional[str] = None  # speaker captured for the current speech segment
+
+        # Conversation mode: who the bot is currently talking with, and when they last spoke
+        self.last_interlocutor: Optional[str] = None
+        self.conversation_active_at: float = 0.0
+
+        # Multi-party awareness from Meet speaker indicators
+        self.participant_names: set[str] = set()       # everyone seen in the call (except this bot)
+        self.speaking_since: Dict[str, float] = {}     # who is speaking right now -> since when
+
         # Diagnostics
         self.turns_count: int = 0
         self.total_speech_secs: float = 0.0
@@ -60,7 +73,10 @@ class VoiceSession:
 
 class GroqVoicePipelineManager:
     # Common Whisper transcriptions of sibling bots in multi-bot Google Meets
-    OTHER_BOT_NAMES: tuple[str, ...] = ("memorae", "boardy", "bordy", "boardie")
+    OTHER_BOT_NAMES: tuple[str, ...] = (
+        "memorae", "memori", "memorie", "memoree", "memoray", "memorai",  # Whisper spellings of Memorae
+        "boardy", "bordy", "boardie",
+    )
     BACKCHANNEL_PHRASES: frozenset[str] = frozenset({
         "ok", "okay", "k", "thanks", "thank you", "cool", "nice", "great",
         "got it", "yeah", "yes", "yep", "nope", "alright", "all right",
@@ -76,7 +92,13 @@ class GroqVoicePipelineManager:
         "what", "why", "how", "when", "where", "who", "whom", "whose", "which",
         "can", "could", "would", "should", "will", "is", "are", "was", "were",
         "do", "does", "did", "have", "has", "tell", "explain", "give", "say",
+        "let", "repeat", "remind", "remember",
     })
+    # Common Whisper mishearings of a bot name (whole words only)
+    NAME_MISHEARINGS: dict[str, tuple[str, ...]] = {
+        "memo": ("mamo", "mehmo", "meemo", "memmo", "mimo", "memoh", "mammo"),
+        "jarvis": ("jervis", "jarvus", "jarves", "jarviss", "jarvice", "javis", "jaavis"),
+    }
 
     def __init__(self):
         self.sessions: Dict[str, VoiceSession] = {}
@@ -88,8 +110,8 @@ class GroqVoicePipelineManager:
         self.silence_threshold_rms: float = 300.0   # Sensitive speech detection
         self.silence_bytes_trigger: int = 36000     # 0.75s silence pause prevents mid-sentence cutoffs
         self.min_speech_bytes: int = 14400          # 0.30s min speech to avoid pops
-        self.max_speech_bytes: int = 480000         # 10.0s max buffer cap
-        self.follow_up_window_secs: float = 18.0    # Follow-up window after bot replies
+        self.max_speech_bytes: int = 960000         # 20.0s max buffer cap (10s was cutting long sentences)
+        self.follow_up_window_secs: float = 30.0    # Conversation mode idle timeout (same speaker)
 
     def _get_client(self) -> AsyncGroq:
         if self.groq_client is None:
@@ -136,16 +158,30 @@ class GroqVoicePipelineManager:
             del self.sessions[k]
         logger.info(f"🧹 Removed voice session {session.session_id}")
 
+    LEADING_FILLERS_RE = re.compile(
+        r"^(?:(?:and|so|but|okay|ok|alright|all right|then|now|yeah|yes|yep|well|um|uh|hmm|right)\b[,.\s]*)+"
+    )
+
     def _looks_like_follow_up(self, text_lower: str) -> bool:
-        """Heuristic: is this a question/request plausibly continuing the bot's last answer?"""
+        """Heuristic: is this a question/request/remark aimed at the bot during an ongoing exchange?"""
         stripped = text_lower.strip().rstrip(".!")
         if not stripped or stripped in self.BACKCHANNEL_PHRASES:
             return False
         if stripped.endswith("?"):
             return True
-        stripped = re.sub(r"^(?:and|so|but|okay|ok|alright|then)\b[,\s]*", "", stripped)
+        # Second person ("can you…", "I'm telling you…", "your name") during an exchange
+        if re.search(r"\b(?:you|your|yours|yourself|you're|you've|you'll)\b", stripped):
+            return True
+        # Question/request opener, after skipping fillers like "yeah okay now so…"
+        stripped = self.LEADING_FILLERS_RE.sub("", stripped)
         words = stripped.split()
         return bool(words) and words[0].strip(",") in self.QUESTION_STARTERS
+
+    def _name_variants(self, bot_name_lower: str) -> list[str]:
+        """Bot name plus common Whisper misspellings (built-in for 'memo', extendable via env)."""
+        variants = list(self.NAME_MISHEARINGS.get(bot_name_lower, ()))
+        variants += [a.strip().lower() for a in settings.bot_name_aliases.split(",") if a.strip()]
+        return [v for v in variants if v and v != bot_name_lower]
 
     @staticmethod
     def _clean_for_speech(text: str) -> str:
@@ -158,12 +194,16 @@ class GroqVoicePipelineManager:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned
 
-    def _evaluate_addressing(self, session: VoiceSession, user_text: str) -> tuple[bool, str]:
+    def _evaluate_addressing(
+        self, session: VoiceSession, user_text: str, speaker: str = "Participant"
+    ) -> tuple[bool, str]:
         """
-        Strict explicit-address gate:
-        - ONLY responds when a participant explicitly calls this bot by its exact name.
+        Addressing gate:
+        - Name said (incl. common Whisper misspellings) -> addressed.
         - Blocks 'Memorae' / 'Memo ray' / 'Boardy' collisions.
-        - Within follow_up_window_secs after the bot spoke, also accepts un-named questions.
+        - Conversation mode: while the SAME person who last talked with the bot keeps talking
+          (no gap longer than follow_up_window_secs), un-named questions / "you" remarks count too.
+          Other participants still have to say the name, so the bot doesn't butt into their talk.
         - Ignores all other speech and saves it as passive context.
         """
         text_lower = user_text.lower().strip()
@@ -172,14 +212,46 @@ class GroqVoicePipelineManager:
         if not bot_name_lower:
             return False, "no_bot_name"
 
-        # Guard against Whisper splitting 'Memorae' into 'memo ray' / 'memo re'
+        # Never answer other AI agents (Memorae agent, Boardy, notetakers): avoids bot-to-bot loops
+        if speaker != "Participant" and self._is_ai_participant(session, speaker):
+            return False, "ai_participant_speaking"
+
+        # Conversation mode bookkeeping: the interlocutor speaking keeps the exchange alive.
+        # Requires a KNOWN speaker: with unknown speakers everyone would look like the interlocutor.
+        now = time.time()
+        in_conversation = (
+            speaker != "Participant"
+            and session.last_interlocutor == speaker
+            and now - session.conversation_active_at <= self.follow_up_window_secs
+        )
+        if in_conversation:
+            session.conversation_active_at = now
+
+        # Guard against Whisper splitting 'Memorae' into 'memo ray' / 'memo-re' / 'memo rae'
         sanitized_text = text_lower
         if bot_name_lower == "memo":
-            sanitized_text = re.sub(r"\bmemo\s+(?:ray|re|rai|rae)\b", "memorae", sanitized_text)
+            sanitized_text = re.sub(r"\bmemo[\s\-]+(?:ray|re|rai|rae|ree|rey|rie)\b", "memorae", sanitized_text)
+
+        # Map common Whisper misspellings of the name ("Mamo", "Mehmo") onto the real name
+        variants = self._name_variants(bot_name_lower)
+        if variants:
+            variant_re = r"\b(?:" + "|".join(re.escape(v) for v in variants) + r")\b"
+            sanitized_text = re.sub(variant_re, bot_name_lower, sanitized_text)
 
         # Require explicit whole-word mention of our bot's name
-        if re.search(rf"\b{re.escape(bot_name_lower)}\b", sanitized_text):
-            return True, "explicit_name"
+        name_re = re.escape(bot_name_lower)
+        if re.search(rf"\b{name_re}\b", sanitized_text):
+            # Vocative use ("Memo, ...", "..., Memo?", "hey Memo") is unambiguous direct address:
+            # the LLM is NOT allowed to veto it with [SILENCE].
+            words_only = re.sub(r"[^a-z0-9' ]", " ", sanitized_text).split()
+            if (
+                (words_only and (words_only[0] == bot_name_lower or words_only[-1] == bot_name_lower))
+                or re.search(rf"\b(?:hey|hi|hello|ok|okay|yo|thanks|thank you)\s*,?\s*{name_re}\b", sanitized_text)
+            ):
+                return True, "direct_address"
+            # Name mid-sentence ("I built memo with FastAPI") may be a third-person mention:
+            # the LLM keeps a [SILENCE] veto for this case.
+            return True, "name_mention"
 
         # Detect sibling bots explicitly for clearer terminal logs
         other_bots = [name for name in self.OTHER_BOT_NAMES if name != bot_name_lower]
@@ -188,14 +260,16 @@ class GroqVoicePipelineManager:
             if re.search(other_pattern, sanitized_text):
                 return False, "other_bot_addressed"
 
-        # Follow-up window: shortly after the bot answered, a question without the name
-        # is most likely aimed at the bot. The LLM still gets a final [SILENCE] veto.
-        if (
-            session.last_bot_spoke_at
-            and time.time() - session.last_bot_spoke_at <= self.follow_up_window_secs
-            and self._looks_like_follow_up(sanitized_text)
-        ):
-            return True, "follow_up"
+        # Conversation mode: un-named question/remark from the person the bot is talking with.
+        # If they name another participant ("Pau, can you see my screen?") it's not for us.
+        if in_conversation:
+            speaker_first = speaker.split()[0].lower() if speaker.split() else ""
+            for other in session.participant_names:
+                first = other.split()[0].lower() if other.split() else ""
+                if len(first) >= 3 and first != speaker_first and re.search(rf"\b{re.escape(first)}\b", sanitized_text):
+                    return False, f"addressed_to_{first}"
+            if self._looks_like_follow_up(sanitized_text):
+                return True, "follow_up"  # the LLM still gets a final [SILENCE] veto
 
         return False, "not_explicitly_addressed"
 
@@ -224,43 +298,89 @@ class GroqVoicePipelineManager:
         async with session.speak_lock:
             return await self._speak_text_locked(session, text)
 
+    FLOOR_WAIT_MAX_SECS: float = 3.0      # max time to wait for others to stop talking before speaking
+    BARGE_IN_SECS: float = 1.0            # someone talking this long over the bot makes it stop
+
+    @staticmethod
+    def _split_sentences(text: str) -> List[str]:
+        """Splits a reply into sentences for pipelined TTS; merges tiny fragments for natural prosody."""
+        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text.strip()) if p.strip()]
+        merged: List[str] = []
+        for part in parts:
+            if merged and len(merged[-1]) < 25:
+                merged[-1] = f"{merged[-1]} {part}"
+            else:
+                merged.append(part)
+        return merged or [text]
+
+    async def _synthesize_pcm(self, text: str) -> bytes:
+        tts_resp = await self._get_client().audio.speech.create(
+            model="canopylabs/orpheus-v1-english",
+            voice="autumn",
+            input=text,
+            response_format="wav"
+        )
+        wav_bytes = await tts_resp.read()
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            return wf.readframes(wf.getnframes())
+
+    async def _wait_for_floor(self, session: VoiceSession) -> None:
+        """Polite turn-taking: if someone else just started talking, give them up to 3s to finish."""
+        waited = 0.0
+        announced = False
+        while waited < self.FLOOR_WAIT_MAX_SECS:
+            talking = self._others_speaking(session)
+            if not talking and not session.user_is_speaking:
+                return
+            if not announced:
+                who = ", ".join(talking) or "someone"
+                print(f"⏸️ [FLOOR] {who} is talking - holding reply (max {self.FLOOR_WAIT_MAX_SECS:.0f}s)...", flush=True)
+                announced = True
+            await asyncio.sleep(0.1)
+            waited += 0.1
+
     async def _speak_text_locked(self, session: VoiceSession, text: str) -> float:
-        client = self._get_client()
-        logger.info(f"🔊 [Groq TTS] Synthesizing speech for: \"{text}\"")
+        """
+        Pipelined TTS: all sentences are synthesized concurrently and playback starts as soon as
+        the FIRST sentence is ready. Waits for a free floor before speaking and stops if someone
+        talks over it (barge-in). Returns time-to-first-audio-ready (TTS latency) in seconds.
+        """
+        sentences = self._split_sentences(text)
+        logger.info(f"🔊 [Groq TTS] Synthesizing {len(sentences)} sentence(s): \"{text}\"")
         tts_start = time.time()
         tts_latency = 0.0
-        
+        tasks = [asyncio.create_task(self._synthesize_pcm(s)) for s in sentences]
+
         try:
-            tts_resp = await client.audio.speech.create(
-                model="canopylabs/orpheus-v1-english",
-                voice="autumn",
-                input=text,
-                response_format="wav"
-            )
-            wav_bytes = await tts_resp.read()
-            tts_latency = time.time() - tts_start
-            logger.info(f"✅ [Groq TTS] Generated {len(wav_bytes):,} bytes in {tts_latency:.2f}s")
-            print(f"🔊 [GROQ ORPHEUS TTS] Generated speech in {tts_latency:.2f}s ({len(wav_bytes):,} bytes)", flush=True)
+            playback_started = 0.0
+            for index, (sentence, task) in enumerate(zip(sentences, tasks)):
+                pcm_data = await task
+                if index == 0:
+                    tts_latency = time.time() - tts_start
+                    print(f"🔊 [GROQ ORPHEUS TTS] First sentence ready in {tts_latency:.2f}s "
+                          f"({len(sentences)} sentence(s), pipelined)", flush=True)
+                    await self._wait_for_floor(session)
+                    session.is_speaking = True
+                    playback_started = time.time()
+                    print(f"▶️ [GOOGLE MEET] Speaking out loud to meeting: \"{text}\"", flush=True)
 
-            # Extract raw PCM frames from WAV
-            with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-                pcm_data = wf.readframes(wf.getnframes())
-
-            session.is_speaking = True
-            logger.info(f"▶️ Streaming {len(pcm_data):,} PCM bytes to Google Meet audio output...")
-            print(f"▶️ [GOOGLE MEET] Speaking out loud to meeting: \"{text}\"", flush=True)
-            
-            # Stream in 20ms chunks (960 bytes at 24kHz 16-bit mono). Always write to the
-            # *current* output socket so a mid-utterance reconnect keeps the audio going.
-            chunk_size = self.chunk_size_bytes
-            for offset in range(0, len(pcm_data), chunk_size):
-                chunk = pcm_data[offset:offset + chunk_size]
-                ws = session.out_websocket
-                if ws is None:
-                    print(f"❌ [GOOGLE MEET] Output socket lost mid-speech - meeting did not hear: \"{text}\"", flush=True)
-                    return tts_latency
-                await asyncio.wait_for(ws.send_bytes(chunk), timeout=2.0)
-                await asyncio.sleep(0.02)  # 20ms real-time pacing
+                # Stream in 20ms chunks (960 bytes at 24kHz 16-bit mono). Always write to the
+                # *current* output socket so a mid-utterance reconnect keeps the audio going.
+                chunk_size = self.chunk_size_bytes
+                for offset in range(0, len(pcm_data), chunk_size):
+                    ws = session.out_websocket
+                    if ws is None:
+                        print(f"❌ [GOOGLE MEET] Output socket lost mid-speech - meeting did not hear: \"{sentence}\"", flush=True)
+                        return tts_latency
+                    # Barge-in: someone who started talking AFTER we began, for >= 1s -> yield
+                    interrupters = self._others_speaking(
+                        session, started_after=playback_started, min_secs=self.BARGE_IN_SECS
+                    )
+                    if interrupters:
+                        print(f"🛑 [BARGE-IN] {', '.join(interrupters)} started talking - stopping playback.", flush=True)
+                        return tts_latency
+                    await asyncio.wait_for(ws.send_bytes(pcm_data[offset:offset + chunk_size]), timeout=2.0)
+                    await asyncio.sleep(0.02)  # 20ms real-time pacing
 
             logger.info(f"⏹️ Finished audio playback for: \"{text}\"")
             print(f"⏹️ [GOOGLE MEET] Finished audio playback.", flush=True)
@@ -270,9 +390,12 @@ class GroqVoicePipelineManager:
             print(f"❌ [GROQ TTS ERROR] {e}", flush=True)
             return tts_latency
         finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
             session.is_speaking = False
 
-    async def process_turn(self, session: VoiceSession, pcm_bytes: bytes) -> None:
+    async def process_turn(self, session: VoiceSession, pcm_bytes: bytes, speaker: str = "Participant") -> None:
         """
         Executes full voice turn:
         1. Groq Whisper STT (whisper-large-v3-turbo)
@@ -310,7 +433,7 @@ class GroqVoicePipelineManager:
             logger.info(f"📝 [Turn #{turn_num}] User said ({stt_latency:.2f}s): \"{user_text}\"")
             print(f"\n" + "=" * 60, flush=True)
             print(f"🎙️ [LIVE TURN #{turn_num}]", flush=True)
-            print(f"📝 [GROQ WHISPER STT] User: \"{user_text}\" ({stt_latency:.2f}s)", flush=True)
+            print(f"📝 [GROQ WHISPER STT] {speaker}: \"{user_text}\" ({stt_latency:.2f}s)", flush=True)
         except Exception as stt_err:
             logger.error(f"❌ [Turn #{turn_num}] Whisper STT error: {stt_err}")
             print(f"❌ [GROQ STT ERROR] {stt_err}", flush=True)
@@ -326,19 +449,20 @@ class GroqVoicePipelineManager:
         if session.turn_lock.locked():
             print(f"⏳ [Turn #{turn_num}] Waiting for previous reply to finish...", flush=True)
         async with session.turn_lock:
-            await self._respond_to_turn(session, turn_num, user_text, stt_latency, turn_start)
+            await self._respond_to_turn(session, turn_num, user_text, stt_latency, turn_start, speaker)
 
     async def _respond_to_turn(
-        self, session: VoiceSession, turn_num: int, user_text: str, stt_latency: float, turn_start: float
+        self, session: VoiceSession, turn_num: int, user_text: str, stt_latency: float, turn_start: float,
+        speaker: str = "Participant"
     ) -> None:
         client = self._get_client()
 
         # 3. Multi-bot safe addressing gate
-        is_addressed, gate_reason = self._evaluate_addressing(session, user_text)
+        is_addressed, gate_reason = self._evaluate_addressing(session, user_text, speaker)
 
         if not is_addressed:
-            # Passively record into rolling in-meeting memory (last 30 utterances, never cleared)
-            session.memory.add_room_utterance(user_text)
+            # Passively record into rolling in-meeting memory (never cleared during the call)
+            session.memory.add_room_utterance(user_text, speaker=speaker)
 
             logger.info(
                 f"🤫 [Turn #{turn_num}] Staying silent ({gate_reason}) "
@@ -357,18 +481,27 @@ class GroqVoicePipelineManager:
 
         # 4. Groq LLM Generation with Rolling In-Meeting Memory
         llm_start = time.time()
-        follow_up_note: Optional[str] = None
-        if gate_reason == "follow_up":
-            follow_up_note = (
-                "The next message did not say your name, but it came right after your last answer "
-                "and looks like a follow-up question to you. Answer it naturally. Reply [SILENCE] "
-                "only if it is clearly directed at another person."
+        must_answer = gate_reason == "direct_address"
+        turn_note: Optional[str] = None
+        if must_answer:
+            turn_note = (
+                "The next message speaks to you directly by name. You MUST answer it out loud. "
+                "Do NOT reply [SILENCE]. If they ask you to remember something, briefly confirm "
+                "you've got it."
+            )
+        elif gate_reason == "follow_up":
+            turn_note = (
+                "The next message did not say your name, but it comes from the person you are "
+                "currently talking with. If it is a question or request, answer it naturally. If they "
+                "are just sharing information with you, reply with a very brief acknowledgement "
+                "(e.g. \"Got it.\") or [SILENCE]. Reply [SILENCE] if it is clearly directed at another person."
             )
 
         messages = session.memory.build_llm_messages(
             system_prompt=session.system_prompt,
             current_user_text=user_text,
-            extra_system_note=follow_up_note,
+            speaker=speaker,
+            extra_system_note=turn_note,
         )
         
         model_name = "qwen/qwen3.8-27b"
@@ -387,9 +520,15 @@ class GroqVoicePipelineManager:
             raw_reply = (llm_resp.choices[0].message.content or "").strip()
             bot_reply = self._clean_for_speech(raw_reply)
 
+            # Direct address can't be vetoed: if the model still tries, strip the token or fall back.
+            if must_answer and (not bot_reply or "[SILENCE]" in bot_reply.upper()):
+                stripped = re.sub(r"\[SILENCE\]", "", bot_reply, flags=re.IGNORECASE).strip()
+                bot_reply = stripped or "Sorry, I didn't quite catch that. Could you say it again?"
+                print(f"⚠️ [GROQ QWEN LLM]   Tried [SILENCE] on a direct address - overridden.", flush=True)
+
             # Honor explicit silence decision from system prompt (still keep utterance in memory!)
             if not bot_reply or "[SILENCE]" in bot_reply.upper():
-                session.memory.add_room_utterance(user_text)
+                session.memory.add_room_utterance(user_text, speaker=speaker)
                 logger.info(f"🤫 [Turn #{turn_num}] LLM chose [SILENCE] ({llm_latency:.2f}s) for: \"{user_text}\"")
                 print(
                     f"🤫 [GROQ QWEN LLM]   Staying silent ({llm_latency:.2f}s) "
@@ -403,7 +542,7 @@ class GroqVoicePipelineManager:
             print(f"🧠 [GROQ QWEN LLM]   {session.bot_name}: \"{bot_reply}\" ({llm_latency:.2f}s)", flush=True)
             
             # Record exchange into rolling timeline + Q&A history (never wipes earlier meeting memory)
-            session.memory.add_exchange(user_text, bot_reply)
+            session.memory.add_exchange(user_text, bot_reply, speaker=speaker)
             print(
                 f"🗂️ [MEETING MEMORY]  {session.memory.utterance_count} rolling utterances | "
                 f"{len(session.memory.qa_history)} Q&A msgs",
@@ -417,6 +556,9 @@ class GroqVoicePipelineManager:
         # 5. Groq TTS Playback
         tts_latency = await self.speak_text(session, bot_reply)
         session.last_bot_spoke_at = time.time()
+        # Start/extend conversation mode with whoever we just answered
+        session.last_interlocutor = speaker
+        session.conversation_active_at = session.last_bot_spoke_at
         
         first_audio_latency = stt_latency + llm_latency + tts_latency
         total_turn_time = time.time() - turn_start
@@ -430,6 +572,81 @@ class GroqVoicePipelineManager:
             flush=True
         )
         print("=" * 60 + "\n", flush=True)
+
+    def _handle_stream_event(self, session: VoiceSession, text_data: str) -> None:
+        """
+        Parses JSON text frames on the audio-in socket:
+        - handshake dict ({"protocol_version", "bot_id", ...}) -> remember bot_id
+        - speaker list ([{"name", "isSpeaking", ...}, ...]) -> track the active human speaker
+        """
+        try:
+            payload = json.loads(text_data)
+        except ValueError:
+            print(f"ℹ️ [AUDIO-IN TEXT] {text_data[:120]}", flush=True)
+            return
+
+        if isinstance(payload, dict):
+            if payload.get("bot_id") and not session.bot_id:
+                session.bot_id = str(payload["bot_id"])
+            print(f"ℹ️ [AUDIO-IN HANDSHAKE] {text_data[:160]}", flush=True)
+            return
+
+        if isinstance(payload, list):
+            bot_name_lower = session.bot_name.lower().strip()
+            now = time.time()
+            speaking_now: set[str] = set()
+            for participant in payload:
+                if not isinstance(participant, dict):
+                    continue
+                name = str(participant.get("name") or "").strip()
+                if not name or name.lower() == bot_name_lower:
+                    continue
+                session.participant_names.add(name)
+                if participant.get("isSpeaking", participant.get("is_speaking")):
+                    speaking_now.add(name)
+
+            # Track when each participant started speaking (used for floor control / barge-in)
+            for name in list(session.speaking_since):
+                if name not in speaking_now:
+                    del session.speaking_since[name]
+            for name in speaking_now:
+                if name not in session.speaking_since:
+                    session.speaking_since[name] = now
+                    tag = " (AI)" if self._is_ai_participant(session, name) else ""
+                    print(f"🗣️ [SPEAKER] {name}{tag} is speaking", flush=True)
+
+            if speaking_now:
+                # Most recent speaker = current one; first speaker during a segment owns it
+                newest = max(speaking_now, key=lambda n: session.speaking_since[n])
+                session.active_speaker = newest
+                if session.user_is_speaking and not session.segment_speaker:
+                    session.segment_speaker = newest
+
+    def _is_ai_participant(self, session: VoiceSession, name: str) -> bool:
+        """Other AI agents / notetakers in the call (by display name)."""
+        lowered = name.lower()
+        if lowered == session.bot_name.lower().strip():
+            return False
+        keywords = list(self.OTHER_BOT_NAMES) + [
+            k.strip().lower() for k in settings.other_ai_participants.split(",") if k.strip()
+        ]
+        if any(k in lowered for k in keywords):
+            return True
+        return bool(re.search(
+            r"\b(?:bot|ai|notetaker|note taker|assistant|recorder|fireflies|otter|fathom|tldv|read\.ai)\b",
+            lowered,
+        ))
+
+    def _others_speaking(self, session: VoiceSession, started_after: float = 0.0, min_secs: float = 0.0) -> list[str]:
+        """
+        Participants currently speaking (per Meet's speaking indicators), excluding this bot.
+        Ignores indicators stuck on for >15s (noisy open mics) so they can't block the bot forever.
+        """
+        now = time.time()
+        return [
+            name for name, since in session.speaking_since.items()
+            if since >= started_after and min_secs <= now - since <= 15.0
+        ]
 
     async def handle_audio_in(self, session: VoiceSession, websocket: WebSocket) -> None:
         """
@@ -452,7 +669,7 @@ class GroqVoicePipelineManager:
                 if not data:
                     text_data = message.get("text")
                     if text_data:
-                        print(f"ℹ️ [AUDIO-IN TEXT] {text_data[:120]}", flush=True)
+                        self._handle_stream_event(session, text_data)
                     continue
                 
                 session.frames_received += 1
@@ -482,6 +699,7 @@ class GroqVoicePipelineManager:
                     if is_speech:
                         if not session.user_is_speaking:
                             print(f"👂 [TERMINAL] Hearing speech in Google Meet... (RMS: {rms:.0f})", flush=True)
+                            session.segment_speaker = None  # filled by speaker events during this segment
                         session.speech_bytes += len(data)
                         session.silence_bytes = 0
                         session.user_is_speaking = True
@@ -508,8 +726,10 @@ class GroqVoicePipelineManager:
                             session.speech_bytes = 0
                             session.silence_bytes = 0
                             
-                            # Launch turn processing asynchronously
-                            asyncio.create_task(self.process_turn(session, speech_pcm))
+                            # Attribute the segment to whoever Meet reported speaking during it
+                            speaker = session.segment_speaker or session.active_speaker or "Participant"
+                            session.segment_speaker = None
+                            asyncio.create_task(self.process_turn(session, speech_pcm, speaker))
                         else:
                             # Too short, discard as noise
                             session.audio_buffer.clear()

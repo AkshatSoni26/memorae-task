@@ -15,6 +15,7 @@ async def ws_audio_in(websocket: WebSocket, session_id: str):
     if not session:
         logger.warning(f"⚠️ Creating ad-hoc voice session for audio-in: {session_id}")
         session = groq_voice_pipeline.create_session(session_id)
+        session.greeted = True  # reconnect after restart: don't greet the meeting again
 
     await groq_voice_pipeline.handle_audio_in(session, websocket)
 
@@ -28,6 +29,8 @@ async def ws_audio_out(websocket: WebSocket, session_id: str):
     if not session:
         logger.warning(f"⚠️ Creating ad-hoc voice session for audio-out: {session_id}")
         session = groq_voice_pipeline.create_session(session_id)
+        # Ad-hoc = the stream reconnected after a server restart: the bot already greeted.
+        session.greeted = True
 
     await groq_voice_pipeline.handle_audio_out(session, websocket)
 
