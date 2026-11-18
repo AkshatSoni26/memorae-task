@@ -17,6 +17,10 @@ class VoiceSession:
 
         # Rolling in-meeting memory (chronological transcript + Q&A history)
         self.memory: MeetingMemory = MeetingMemory(bot_name=bot_name)
+        # Running notes (people, facts, todos, summary) kept up to date in the background
+        from app.services.voice.memory_notes import NotesUpdater
+        self.notes_updater: NotesUpdater = NotesUpdater(self)
+        self.memory.on_append = self.notes_updater.notify
         self.last_bot_spoke_at: float = 0.0
 
         # Audio state

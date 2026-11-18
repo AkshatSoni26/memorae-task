@@ -53,7 +53,7 @@ class SessionManager:
             engines = f"STT: Deepgram {settings.deepgram_stt_model} | TTS: Deepgram {settings.deepgram_tts_model}"
         else:
             engines = f"STT: Groq {settings.groq_stt_model} | TTS: Groq {settings.groq_tts_model} ({settings.groq_tts_voice})"
-        print(f"🎛️ [ENGINES] USE_GROQ={settings.use_groq} -> {engines} | LLM: Groq {settings.groq_llm_model}", flush=True)
+        print(f"🎛️ [ENGINES] USE_GROQ={settings.use_groq} -> {engines} | LLM: Groq {settings.groq_llm_model} | Notes: {settings.memory_notes_model if settings.memory_notes_enabled else 'off'}", flush=True)
 
         if bot_name:
             self.save_session_meta(session_id, {"bot_name": name, "entry_message": entry_message})
@@ -80,6 +80,8 @@ class SessionManager:
             self.sessions[meta["bot_id"]] = session
             session.bot_id = meta["bot_id"]
         session.greeted = True
+        if session.notes_updater.restore():
+            print(f"📝 [MEETING NOTES] Restored notes saved before the restart", flush=True)
         print(
             f"♻️ [RESTORE] Session {session_id} reconnected after restart as "
             f"'{session.bot_name}'{'' if meta else ' (no saved name - using default)'}",

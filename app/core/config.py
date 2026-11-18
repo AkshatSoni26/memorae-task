@@ -33,6 +33,15 @@ class Settings:
         # (The LLM is always Groq.)
         self.use_groq: bool = os.getenv("USE_GROQ", "false").strip().lower() in ("1", "true", "yes", "on")
         self.deepgram_api_key: str = os.getenv("DEEPGRAM_API_KEY", "")
+
+        # In-meeting memory: running notes rewritten in the background by a small Groq model
+        # (its own rate limit, separate from the reply model). MEMORY_NOTES_ENABLED=false turns it off.
+        self.memory_notes_enabled: bool = os.getenv("MEMORY_NOTES_ENABLED", "true").lower() == "true"
+        self.memory_notes_model: str = os.getenv("MEMORY_NOTES_MODEL", "openai/gpt-oss-20b")
+        self.memory_notes_batch_lines: int = int(os.getenv("MEMORY_NOTES_BATCH_LINES", "8"))
+        self.memory_notes_idle_secs: float = float(os.getenv("MEMORY_NOTES_IDLE_SECS", "20"))
+        self.memory_notes_max_words: int = int(os.getenv("MEMORY_NOTES_MAX_WORDS", "300"))
+        self.memory_notes_max_tokens: int = int(os.getenv("MEMORY_NOTES_MAX_TOKENS", "1500"))
         self.deepgram_tts_model: str = os.getenv("DEEPGRAM_TTS_MODEL", "flux-sienna-en")
         self.deepgram_stt_model: str = os.getenv("DEEPGRAM_STT_MODEL", "nova-3")
         self.deepgram_speak_url: str = os.getenv("DEEPGRAM_SPEAK_URL", "https://api.deepgram.com/v2/speak")
