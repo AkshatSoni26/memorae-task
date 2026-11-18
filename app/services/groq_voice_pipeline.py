@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import io
 import json
 import os
@@ -99,7 +100,7 @@ class GroqVoicePipelineManager:
     # Common Whisper mishearings of a bot name (whole words only)
     NAME_MISHEARINGS: dict[str, tuple[str, ...]] = {
         "memo": ("mamo", "mehmo", "meemo", "memmo", "mimo", "memoh", "mammo"),
-        "jarvis": ("jervis", "jarvus", "jarves", "jarviss", "jarvice", "javis", "jaavis"),
+        "jarvis": ("javish", "jaavish", "jarvish", "havas", "jervis", "jarvus", "jarves", "jarviss", "jarvice", "javis", "jaavis"),
     }
 
     def __init__(self):
@@ -242,8 +243,14 @@ class GroqVoicePipelineManager:
             variant_re = r"\b(?:" + "|".join(re.escape(v) for v in variants) + r")\b"
             sanitized_text = re.sub(variant_re, bot_name_lower, sanitized_text)
 
-        # Require explicit whole-word mention of our bot's name
+        # Near-miss spellings in vocative position ("Javish, can you...") count as the name
         name_re = re.escape(bot_name_lower)
+        if not re.search(rf"\b{name_re}\b", sanitized_text):
+            misheard = self._fuzzy_vocative(re.sub(r"[^a-z0-9' ]", " ", sanitized_text).split(), bot_name_lower)
+            if misheard:
+                sanitized_text = re.sub(rf"\b{re.escape(misheard)}\b", bot_name_lower, sanitized_text)
+
+        # Require explicit whole-word mention of our bot's name
         if re.search(rf"\b{name_re}\b", sanitized_text):
             # Vocative use ("Memo, ...", "..., Memo?", "hey Memo") is unambiguous direct address:
             # the LLM is NOT allowed to veto it with [SILENCE].
@@ -269,10 +276,17 @@ class GroqVoicePipelineManager:
 
         # Detect sibling bots explicitly for clearer terminal logs
         other_bots = [name for name in self.OTHER_BOT_NAMES if name != bot_name_lower]
+        other_bots += [n.lower() for n in self._sibling_bot_names(session)]
         if other_bots:
             other_pattern = r"\b(?:" + "|".join(re.escape(n) for n in other_bots) + r")\b"
             if re.search(other_pattern, sanitized_text):
                 return False, "other_bot_addressed"
+
+        # "Introduce yourselves", "can the bots say hi?" -> the LLM decides (may still [SILENCE])
+        if re.search(r"\byourselves\b", sanitized_text) or (
+            self.GROUP_ADDRESS_RE.search(sanitized_text) and self._looks_like_follow_up(sanitized_text)
+        ):
+            return True, "group_address"
 
         # Conversation mode: un-named question/remark from the person the bot is talking with.
         # If they name another participant ("Pau, can you see my screen?") it's not for us.
@@ -447,7 +461,8 @@ class GroqVoicePipelineManager:
                 file=("speech.wav", wav_payload, "audio/wav"),
                 model="whisper-large-v3-turbo",
                 language="en",
-                temperature=0.0
+                temperature=0.0,
+                prompt=self._stt_prompt(session),
             )
             stt_latency = time.time() - stt_start
             user_text = stt_result.text.strip()
@@ -518,6 +533,13 @@ class GroqVoicePipelineManager:
                 "Do NOT reply [SILENCE]. If they ask you to remember something, briefly confirm "
                 "you've got it."
             )
+        elif gate_reason == "group_address":
+            turn_note = (
+                "The next message speaks to the whole room or to all the AI assistants together "
+                "(e.g. \"introduce yourselves\"). If it asks the AIs or everyone to say or do something "
+                "you can do by talking, answer it briefly in one to three sentences. If it is a general "
+                "remark to the humans (like \"everyone, welcome\"), reply [SILENCE]."
+            )
         elif gate_reason == "follow_up":
             turn_note = (
                 "The next message did not say your name, but it comes from the person you are "
@@ -549,11 +571,36 @@ class GroqVoicePipelineManager:
             raw_reply = (llm_resp.choices[0].message.content or "").strip()
             bot_reply = self._clean_for_speech(raw_reply)
 
-            # Direct address can't be vetoed: if the model still tries, strip the token or fall back.
+            # Direct address can't be vetoed: if the model still tries, strip the token, ask it once
+            # more without the silence option, and only then fall back to a canned line.
             if must_answer and (not bot_reply or "[SILENCE]" in bot_reply.upper()):
                 stripped = re.sub(r"\[SILENCE\]", "", bot_reply, flags=re.IGNORECASE).strip()
+                print(f"⚠️ [GROQ QWEN LLM]   Tried [SILENCE] on a direct address - asking again.", flush=True)
+                if not stripped:
+                    try:
+                        retry_messages = messages + [{
+                            "role": "system",
+                            "content": (
+                                f"{speaker} is talking to YOU right now. [SILENCE] is not allowed for "
+                                "this message. Reply out loud in one to three natural sentences. If they "
+                                "ask you to answer someone else's question, find that question in the "
+                                "meeting transcript and answer it yourself."
+                            ),
+                        }]
+                        retry_resp = await client.chat.completions.create(
+                            model=model_name,
+                            messages=retry_messages,
+                            max_tokens=settings.llm_max_tokens,
+                            temperature=0.7,
+                        )
+                        stripped = re.sub(
+                            r"\[SILENCE\]", "",
+                            self._clean_for_speech(retry_resp.choices[0].message.content or ""),
+                            flags=re.IGNORECASE,
+                        ).strip()
+                    except Exception as retry_err:
+                        logger.warning(f"⚠️ [Turn #{turn_num}] Retry after [SILENCE] failed: {retry_err}")
                 bot_reply = stripped or "Sorry, I didn't quite catch that. Could you say it again?"
-                print(f"⚠️ [GROQ QWEN LLM]   Tried [SILENCE] on a direct address - overridden.", flush=True)
 
             # Honor explicit silence decision from system prompt (still keep utterance in memory!)
             if not bot_reply or "[SILENCE]" in bot_reply.upper():
@@ -655,11 +702,57 @@ class GroqVoicePipelineManager:
                 if session.user_is_speaking and not session.segment_speaker:
                     session.segment_speaker = newest
 
+    def _sibling_bot_names(self, session: VoiceSession) -> list[str]:
+        """Display names of OTHER bots run by this server (they are AI participants too)."""
+        names = {s.bot_name.strip() for s in self.sessions.values() if s is not session and s.bot_name}
+        return sorted(n for n in names if n.lower() != session.bot_name.lower().strip())
+
+    def _stt_prompt(self, session: VoiceSession) -> str:
+        """
+        Whisper spelling hint: names of this bot, the people and the AIs in the call, so Whisper
+        writes 'Jarvis' instead of 'Javish' / 'Havas'. Groq caps this at 224 tokens: keep it short.
+        """
+        names: list[str] = [session.bot_name.strip()]
+        names += sorted(session.participant_names)
+        names += self._sibling_bot_names(session)
+        names += ["Boardy", "Memorae", "Pau"]
+        seen: set[str] = set()
+        unique = [n for n in names if n and not (n.lower() in seen or seen.add(n.lower()))]
+        return ("Google Meet call with " + ", ".join(unique[:20]) + ".")[:600]
+
+    def _fuzzy_vocative(self, words: list[str], bot_name_lower: str) -> Optional[str]:
+        """
+        Whisper near-misses of the name ('javish', 'jaavish') in the vocative spots only:
+        first word, last word, or right after a greeting. Returns the misheard word, or None.
+        """
+        if len(bot_name_lower) < 5 or not words:
+            return None
+        candidates = {words[0], words[-1]}
+        for i, w in enumerate(words[:-1]):
+            if w in ("hey", "hi", "hello", "ok", "okay", "yo", "thanks"):
+                candidates.add(words[i + 1])
+        for w in candidates:
+            if (
+                w != bot_name_lower
+                and w[:1] == bot_name_lower[:1]
+                and abs(len(w) - len(bot_name_lower)) <= 2
+                and difflib.SequenceMatcher(None, w, bot_name_lower).ratio() >= 0.75
+            ):
+                return w
+        return None
+
+    GROUP_ADDRESS_RE = re.compile(
+        r"\b(?:everyone|everybody|all of you|both of you|you all|y'all|you guys|yourselves|each of you"
+        r"|(?:the |all the |both )?(?:bots|agents|ais|assistants))\b"
+    )
+
     def _is_ai_participant(self, session: VoiceSession, name: str) -> bool:
         """Other AI agents / notetakers in the call (by display name)."""
         lowered = name.lower()
         if lowered == session.bot_name.lower().strip():
             return False
+        if lowered in (n.lower() for n in self._sibling_bot_names(session)):
+            return True
         keywords = list(self.OTHER_BOT_NAMES) + [
             k.strip().lower() for k in settings.other_ai_participants.split(",") if k.strip()
         ]
