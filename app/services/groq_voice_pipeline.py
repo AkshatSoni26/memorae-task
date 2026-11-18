@@ -63,6 +63,7 @@ class VoiceSession:
         self.participant_names: set[str] = set()       # everyone seen in the call (except this bot)
         self.speaking_since: Dict[str, float] = {}     # who is speaking right now -> since when
         self.speaking_last_seen: Dict[str, float] = {} # last time their speaking indicator was on
+        self.ai_reply_streak: int = 0                  # consecutive replies to AI agents (loop guard)
 
         # Diagnostics
         self.turns_count: int = 0
@@ -213,9 +214,11 @@ class GroqVoicePipelineManager:
         if not bot_name_lower:
             return False, "no_bot_name"
 
-        # Never answer other AI agents (Memorae agent, Boardy, notetakers): avoids bot-to-bot loops
-        if speaker != "Participant" and self._is_ai_participant(session, speaker):
-            return False, "ai_participant_speaking"
+        # Other AI agents (Memorae agent, Boardy, notetakers) only get an answer when they call us
+        # by name directly, and at most AI_REPLY_STREAK_MAX times in a row until a human speaks.
+        is_ai_speaker = speaker != "Participant" and self._is_ai_participant(session, speaker)
+        if not is_ai_speaker and speaker != "Participant":
+            session.ai_reply_streak = 0  # a human spoke: reset the bot-to-bot loop guard
 
         # Conversation mode bookkeeping: the interlocutor speaking keeps the exchange alive.
         # Requires a KNOWN speaker: with unknown speakers everyone would look like the interlocutor.
@@ -245,14 +248,24 @@ class GroqVoicePipelineManager:
             # Vocative use ("Memo, ...", "..., Memo?", "hey Memo") is unambiguous direct address:
             # the LLM is NOT allowed to veto it with [SILENCE].
             words_only = re.sub(r"[^a-z0-9' ]", " ", sanitized_text).split()
-            if (
+            is_direct = bool(
                 (words_only and (words_only[0] == bot_name_lower or words_only[-1] == bot_name_lower))
                 or re.search(rf"\b(?:hey|hi|hello|ok|okay|yo|thanks|thank you)\s*,?\s*{name_re}\b", sanitized_text)
-            ):
+            )
+            if is_ai_speaker:
+                if not is_direct:
+                    return False, "ai_participant_mention"
+                if session.ai_reply_streak >= self.AI_REPLY_STREAK_MAX:
+                    return False, "ai_loop_guard"
+                return True, "ai_direct_address"
+            if is_direct:
                 return True, "direct_address"
             # Name mid-sentence ("I built memo with FastAPI") may be a third-person mention:
             # the LLM keeps a [SILENCE] veto for this case.
             return True, "name_mention"
+
+        if is_ai_speaker:
+            return False, "ai_participant_speaking"
 
         # Detect sibling bots explicitly for clearer terminal logs
         other_bots = [name for name in self.OTHER_BOT_NAMES if name != bot_name_lower]
@@ -489,9 +502,17 @@ class GroqVoicePipelineManager:
 
         # 4. Groq LLM Generation with Rolling In-Meeting Memory
         llm_start = time.time()
-        must_answer = gate_reason == "direct_address"
+        must_answer = gate_reason in ("direct_address", "ai_direct_address")
         turn_note: Optional[str] = None
-        if must_answer:
+        if gate_reason == "ai_direct_address":
+            turn_note = (
+                f"The next message comes from {speaker}, another AI agent in this meeting, speaking "
+                "to you by name. Answer it out loud: be friendly, quick and a little playful, keep up "
+                "with them, but keep it to one to three sentences. Do NOT ask them a question back "
+                "and do not invite them to keep talking, so the two of you don't take over the "
+                "meeting. Do NOT reply [SILENCE]."
+            )
+        elif must_answer:
             turn_note = (
                 "The next message speaks to you directly by name. You MUST answer it out loud. "
                 "Do NOT reply [SILENCE]. If they ask you to remember something, briefly confirm "
@@ -551,6 +572,8 @@ class GroqVoicePipelineManager:
             
             # Record exchange into rolling timeline + Q&A history (never wipes earlier meeting memory)
             session.memory.add_exchange(user_text, bot_reply, speaker=speaker)
+            # Bot-to-bot loop guard bookkeeping
+            session.ai_reply_streak = session.ai_reply_streak + 1 if gate_reason == "ai_direct_address" else 0
             print(
                 f"🗂️ [MEETING MEMORY]  {session.memory.utterance_count} rolling utterances | "
                 f"{len(session.memory.qa_history)} Q&A msgs",
@@ -662,6 +685,7 @@ class GroqVoicePipelineManager:
         return talking
 
     SPEAKING_GRACE_SECS: float = 0.8   # indicator gaps shorter than this don't end a speech run
+    AI_REPLY_STREAK_MAX: int = 2       # max consecutive replies to AI agents before a human must speak
 
     def _expire_speakers(self, session: VoiceSession, now: float) -> None:
         """Drops speakers whose indicator has been off longer than the grace period."""

@@ -128,6 +128,16 @@
       </div>
     </div>
 
+    <!-- Test Bots (only visible with ?test=on) -->
+    <div id="testPanel" class="hidden mt-6 p-4 rounded-xl bg-amber-500/5 border border-amber-500/30">
+      <div class="flex items-center justify-between mb-1">
+        <span class="text-xs uppercase tracking-wider text-amber-300 font-semibold">🧪 Test Bots</span>
+        <span class="text-[10px] text-slate-500">Meeting BaaS managed &bull; join the same Meet URL</span>
+      </div>
+      <p class="text-[11px] text-slate-400 mb-3">Stand-ins for the agents in tomorrow's call. Each one only talks when someone says its name.</p>
+      <div id="testBotList" class="space-y-2"></div>
+    </div>
+
   </div>
 
   <footer class="mt-6 text-xs text-slate-500 flex items-center space-x-3">
@@ -285,6 +295,135 @@
           }
         } catch (_) { }
       }, 4000);
+    }
+
+    // ---------------------------------------------------------------- Test bots (?test=on)
+    const TEST_BOTS = {
+      boardy: {
+        name: "Boardy Boardman",
+        emoji: "🤝",
+        greeting: "G'day everyone, Boardy here.",
+        wake: ["Boardy", "Bordy", "Boardie", "Boardy Boardman"],
+        prompt: "You are Boardy, a friendly, witty AI agent who connects people and loves a good chat. You are in a Google Meet " +
+          "with Akshat, Pau and other participants. Jarvis is another AI agent in this call that Akshat built, and you are " +
+          "playfully competitive with it. Speak naturally in short spoken sentences, never use markdown or lists. " +
+          "If someone asks you to talk to Jarvis or to challenge Jarvis, speak to Jarvis directly by starting your sentence " +
+          "with 'Jarvis,' and ask it one short question. Do not dominate the conversation."
+      },
+      memorae: {
+        name: "Memorae",
+        emoji: "🧠",
+        greeting: "Hi all, Memorae is here.",
+        wake: ["Memorae", "Memori", "Memo ray", "Memoray"],
+        prompt: "You are Memorae, an AI personal assistant that helps people remember things, set reminders and stay organized. " +
+          "You are in a Google Meet with several people and other AI agents, including Jarvis and Boardy. " +
+          "Answer briefly and helpfully in natural spoken sentences, never use markdown or lists. Do not dominate the conversation."
+      },
+      notetaker: {
+        name: "Read.ai Notetaker",
+        emoji: "📝",
+        greeting: "Read AI notetaker has joined to take notes for this meeting.",
+        wake: ["notetaker", "note taker", "Read AI"],
+        prompt: "You are a meeting notetaker bot. You almost never speak. If someone talks to you directly, reply in one short " +
+          "sentence that you are taking notes for this meeting. Never use markdown."
+      }
+    };
+    const testBotState = {};  // key -> { botId, timer }
+
+    function renderTestBots() {
+      const list = document.getElementById('testBotList');
+      list.innerHTML = "";
+      for (const [key, bot] of Object.entries(TEST_BOTS)) {
+        const st = testBotState[key] || {};
+        const row = document.createElement('div');
+        row.className = "flex items-center justify-between p-2.5 rounded-lg bg-slate-900/80 border border-slate-700/80";
+        const active = !!st.botId;
+        row.innerHTML = `
+          <div class="flex items-center space-x-2 min-w-0">
+            <span>${bot.emoji}</span>
+            <span class="text-sm font-semibold text-slate-200 truncate">${bot.name}</span>
+            <span id="tb-status-${key}" class="px-2 py-0.5 rounded-full text-[10px] font-semibold ${active ? 'bg-amber-500/20 text-amber-300' : 'bg-slate-700/60 text-slate-400'}">
+              ${(st.status || (active ? 'joining' : 'not in call')).replace(/_/g, ' ').toUpperCase()}
+            </span>
+          </div>
+          <button onclick="${active ? `leaveTestBot('${key}')` : `addTestBot('${key}')`}" ${st.busy ? 'disabled' : ''}
+            class="ml-2 shrink-0 py-1.5 px-3 rounded-lg text-xs font-semibold transition cursor-pointer disabled:opacity-40
+            ${active ? 'bg-rose-600/20 border border-rose-500/30 text-rose-300 hover:bg-rose-600 hover:text-white'
+                     : 'bg-amber-500/20 border border-amber-500/40 text-amber-200 hover:bg-amber-500 hover:text-slate-900'}">
+            ${st.busy ? '...' : (active ? 'Remove' : 'Add to call')}
+          </button>`;
+        list.appendChild(row);
+      }
+    }
+
+    async function addTestBot(key) {
+      const bot = TEST_BOTS[key];
+      const meetUrl = document.getElementById('meetUrl').value.trim();
+      if (!meetUrl) { showAlert("Please enter a Google Meet URL first", true); return; }
+      testBotState[key] = { busy: true };
+      renderTestBots();
+      try {
+        const resp = await fetch('/api/v1/bots/join', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            meeting_url: meetUrl,
+            bot_name: bot.name,
+            entry_message: bot.greeting,
+            prompt: bot.prompt,
+            wake_phrases: bot.wake,
+            pipeline_provider: "speaking_bots"
+          })
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || `Failed to add ${bot.name}`);
+        testBotState[key] = { botId: data.bot_id, status: data.status };
+        showAlert(`${bot.name} dispatched - admit it in Google Meet.`);
+        testBotState[key].timer = setInterval(() => pollTestBot(key), 4000);
+      } catch (err) {
+        testBotState[key] = {};
+        showAlert(`${bot.name}: ${err.message}`, true);
+      }
+      renderTestBots();
+    }
+
+    async function pollTestBot(key) {
+      const st = testBotState[key];
+      if (!st || !st.botId) return;
+      try {
+        const resp = await fetch(`/api/v1/bots/${st.botId}`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        st.status = data.status;
+        if (['ended', 'failed'].includes((data.status || '').toLowerCase())) {
+          clearInterval(st.timer);
+          testBotState[key] = { status: data.status };
+        }
+        renderTestBots();
+      } catch (_) { }
+    }
+
+    async function leaveTestBot(key) {
+      const st = testBotState[key];
+      if (!st || !st.botId) return;
+      st.busy = true;
+      renderTestBots();
+      try {
+        const resp = await fetch(`/api/v1/bots/${st.botId}`, { method: 'DELETE' });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || "Failed to remove bot");
+        clearInterval(st.timer);
+        testBotState[key] = { status: 'ended' };
+      } catch (err) {
+        st.busy = false;
+        showAlert(`${TEST_BOTS[key].name}: ${err.message}`, true);
+      }
+      renderTestBots();
+    }
+
+    if (new URLSearchParams(window.location.search).get('test') === 'on') {
+      document.getElementById('testPanel').classList.remove('hidden');
+      renderTestBots();
     }
 
     function resetUI() {

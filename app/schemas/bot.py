@@ -30,6 +30,10 @@ class JoinMeetingRequest(BaseModel):
         default=None,
         description="Webhook URL for meeting callbacks (optional)"
     )
+    wake_phrases: Optional[List[str]] = Field(
+        default=None,
+        description="Speaking Bots only: other ways the bot's name may be heard (spellings, nicknames)"
+    )
     pipeline_provider: Optional[str] = Field(
         default="groq",
         description="Voice pipeline engine: 'groq' (Groq Whisper + Qwen + Orpheus) or 'speaking_bots'",

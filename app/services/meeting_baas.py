@@ -182,7 +182,9 @@ class MeetingBaaSClient:
         if pipeline_mode == "groq":
             return self._dispatch_groq(cleaned_url, bot_name, entry_message, custom_prompt, callback_url)
         if pipeline_mode in ("speaking_bots", "speaking", "hosted"):
-            return self._dispatch_speaking_bot(cleaned_url, bot_name, entry_message, custom_prompt, callback_url)
+            return self._dispatch_speaking_bot(
+                cleaned_url, bot_name, entry_message, custom_prompt, callback_url, request.wake_phrases
+            )
         raise MeetingServiceError(
             f"Unknown pipeline_provider '{request.pipeline_provider}'. Use 'groq' or 'speaking_bots'.",
             status_code=400
@@ -263,7 +265,8 @@ class MeetingBaaSClient:
         )
 
     def _dispatch_speaking_bot(
-        self, meeting_url: str, bot_name: str, entry_message: str, custom_prompt: str, callback_url: str | None
+        self, meeting_url: str, bot_name: str, entry_message: str, custom_prompt: str, callback_url: str | None,
+        wake_phrases: list[str] | None = None
     ) -> BotResponseData:
         """Hosted fallback: Meeting BaaS Speaking Bots (Deepgram + GPT-4o-mini + Cartesia)."""
         prompt = custom_prompt or load_system_prompt(bot_name=bot_name, include_silence_token=False)
@@ -286,6 +289,8 @@ class MeetingBaaSClient:
         }
         if callback_url:
             payload["callback_url"] = callback_url
+        if wake_phrases:
+            payload["wake_phrases"] = [p.strip() for p in wake_phrases if p and p.strip()]
 
         logger.info(f"📡 Sending request to Speaking Bots API: {settings.speaking_api_url}")
         resp = self._post(settings.speaking_api_url, payload)

@@ -4,6 +4,8 @@ from app.core.logger import logger
 
 PROMPTS_DIR: Path = Path(__file__).resolve().parent
 DEFAULT_PROMPT_FILE: Path = PROMPTS_DIR / "system_prompt.md"
+# Optional meeting-specific context (who built the bot, who's in the call); appended when present
+BRIEFING_FILE: Path = PROMPTS_DIR / "briefing.md"
 
 def load_system_prompt(
     bot_name: str | None = None,
@@ -27,6 +29,9 @@ def load_system_prompt(
                 if "[SILENCE]" not in line and "exact token" not in line.lower()
             ]
             raw_content = "\n".join(filtered_lines).strip()
+
+        if prompt_path is None and BRIEFING_FILE.exists():
+            raw_content = f"{raw_content}\n\n{BRIEFING_FILE.read_text(encoding='utf-8').strip()}"
 
         rendered: str = raw_content.replace("{bot_name}", resolved_name)
         logger.info(
