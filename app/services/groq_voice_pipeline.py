@@ -62,6 +62,7 @@ class VoiceSession:
         # Multi-party awareness from Meet speaker indicators
         self.participant_names: set[str] = set()       # everyone seen in the call (except this bot)
         self.speaking_since: Dict[str, float] = {}     # who is speaking right now -> since when
+        self.speaking_last_seen: Dict[str, float] = {} # last time their speaking indicator was on
 
         # Diagnostics
         self.turns_count: int = 0
@@ -349,7 +350,14 @@ class GroqVoicePipelineManager:
         logger.info(f"🔊 [Groq TTS] Synthesizing {len(sentences)} sentence(s): \"{text}\"")
         tts_start = time.time()
         tts_latency = 0.0
-        tasks = [asyncio.create_task(self._synthesize_pcm(s)) for s in sentences]
+        # At most 3 TTS requests in flight: keeps playback fed without tripping Groq rate limits
+        tts_slots = asyncio.Semaphore(3)
+
+        async def synth_limited(sentence_text: str) -> bytes:
+            async with tts_slots:
+                return await self._synthesize_pcm(sentence_text)
+
+        tasks = [asyncio.create_task(synth_limited(s)) for s in sentences]
 
         try:
             playback_started = 0.0
@@ -513,7 +521,7 @@ class GroqVoicePipelineManager:
             llm_resp = await client.chat.completions.create(
                 model=model_name,
                 messages=messages,
-                max_tokens=120,
+                max_tokens=settings.llm_max_tokens,
                 temperature=0.5
             )
             llm_latency = time.time() - llm_start
@@ -605,15 +613,17 @@ class GroqVoicePipelineManager:
                 if participant.get("isSpeaking", participant.get("is_speaking")):
                     speaking_now.add(name)
 
-            # Track when each participant started speaking (used for floor control / barge-in)
-            for name in list(session.speaking_since):
-                if name not in speaking_now:
-                    del session.speaking_since[name]
+            # Track when each participant started speaking (used for floor control / barge-in).
+            # Meet's indicator flickers between words, so a speaker only "stops" after
+            # SPEAKING_GRACE_SECS without the indicator; short gaps keep the same speech run.
             for name in speaking_now:
-                if name not in session.speaking_since:
+                last_seen = session.speaking_last_seen.get(name)
+                if name not in session.speaking_since or last_seen is None or now - last_seen > self.SPEAKING_GRACE_SECS:
                     session.speaking_since[name] = now
                     tag = " (AI)" if self._is_ai_participant(session, name) else ""
                     print(f"🗣️ [SPEAKER] {name}{tag} is speaking", flush=True)
+                session.speaking_last_seen[name] = now
+            self._expire_speakers(session, now)
 
             if speaking_now:
                 # Most recent speaker = current one; first speaker during a segment owns it
@@ -643,10 +653,23 @@ class GroqVoicePipelineManager:
         Ignores indicators stuck on for >15s (noisy open mics) so they can't block the bot forever.
         """
         now = time.time()
-        return [
-            name for name, since in session.speaking_since.items()
-            if since >= started_after and min_secs <= now - since <= 15.0
-        ]
+        self._expire_speakers(session, now)
+        talking = []
+        for name, since in session.speaking_since.items():
+            heard_for = session.speaking_last_seen.get(name, since) - since  # actual observed speech run
+            if since >= started_after and heard_for >= min_secs and now - since <= 15.0:
+                talking.append(name)
+        return talking
+
+    SPEAKING_GRACE_SECS: float = 0.8   # indicator gaps shorter than this don't end a speech run
+
+    def _expire_speakers(self, session: VoiceSession, now: float) -> None:
+        """Drops speakers whose indicator has been off longer than the grace period."""
+        for name in list(session.speaking_since):
+            last_seen = session.speaking_last_seen.get(name, 0.0)
+            if now - last_seen > self.SPEAKING_GRACE_SECS:
+                del session.speaking_since[name]
+                session.speaking_last_seen.pop(name, None)
 
     async def handle_audio_in(self, session: VoiceSession, websocket: WebSocket) -> None:
         """

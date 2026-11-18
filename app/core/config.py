@@ -27,7 +27,7 @@ class Settings:
         # LiteLLM Model Configuration
         self.llm_model: str = os.getenv("LLM_MODEL", "groq/qwen/qwen3.8-27b")
         self.llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.7"))
-        self.llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "150"))
+        self.llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "400"))
 
         # Bot Persona & Behavior Defaults
         self.default_bot_name: str = os.getenv("DEFAULT_BOT_NAME", "Jarvis")
