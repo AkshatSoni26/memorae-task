@@ -30,6 +30,7 @@ async def poll_active_bots_usage():
                         print("\n" + "=" * 55)
                         print(f"⚡ [GROQ PIPELINE METRICS] Bot: {bot_id} ('{groq_sess.bot_name}')")
                         print(f"🧠 Conversational Turns:    {turns}")
+                        print(f"🗂️ Rolling Meeting Memory:  {groq_sess.memory.utterance_count} utterances")
                         print(f"💬 Conversation History:   {len(groq_sess.conversation_history)} messages")
                         print(f"🔌 Audio In Connected:     {groq_sess.in_websocket is not None}")
                         print(f"📢 Audio Out Connected:    {groq_sess.out_websocket is not None}")

@@ -11,6 +11,7 @@ from groq import AsyncGroq
 from app.core.config import settings
 from app.core.logger import logger
 from app.prompts import load_system_prompt
+from app.services.meeting_memory import MeetingMemory
 
 class VoiceSession:
     def __init__(self, session_id: str, bot_name: str, system_prompt: str, entry_message: str):
@@ -23,9 +24,8 @@ class VoiceSession:
         self.in_websocket: Optional[WebSocket] = None
         self.out_websocket: Optional[WebSocket] = None
         
-        # Conversation & room context
-        self.conversation_history: List[Dict[str, str]] = []
-        self.recent_room_context: List[str] = []
+        # Rolling in-meeting memory (chronological transcript + Q&A history)
+        self.memory: MeetingMemory = MeetingMemory(bot_name=bot_name)
         self.last_bot_spoke_at: float = 0.0
         
         # Audio state
@@ -53,6 +53,10 @@ class VoiceSession:
         # Diagnostics
         self.turns_count: int = 0
         self.total_speech_secs: float = 0.0
+
+    @property
+    def conversation_history(self) -> List[Dict[str, str]]:
+        return self.memory.qa_history
 
 class GroqVoicePipelineManager:
     # Common Whisper transcriptions of sibling bots in multi-bot Google Meets
@@ -333,45 +337,45 @@ class GroqVoicePipelineManager:
         is_addressed, gate_reason = self._evaluate_addressing(session, user_text)
 
         if not is_addressed:
-            # Passively remember last 6 overheard lines so the bot keeps meeting context
-            session.recent_room_context.append(user_text)
-            if len(session.recent_room_context) > 6:
-                session.recent_room_context = session.recent_room_context[-6:]
+            # Passively record into rolling in-meeting memory (last 30 utterances, never cleared)
+            session.memory.add_room_utterance(user_text)
 
-            logger.info(f"🤫 [Turn #{turn_num}] Staying silent ({gate_reason}): \"{user_text}\"")
-            print(f"🤫 [ADDRESSING GATE] Staying silent ({gate_reason})", flush=True)
+            logger.info(
+                f"🤫 [Turn #{turn_num}] Staying silent ({gate_reason}) "
+                f"[memory: {session.memory.utterance_count} utterances]: \"{user_text}\""
+            )
+            print(
+                f"🤫 [ADDRESSING GATE] Staying silent ({gate_reason}) "
+                f"| 🧠 Memory: {session.memory.utterance_count} utterances",
+                flush=True
+            )
             print("=" * 60 + "\n", flush=True)
             return
 
         logger.info(f"🎯 [Turn #{turn_num}] Addressing gate passed ({gate_reason})")
         print(f"🎯 [ADDRESSING GATE] Engaged ({gate_reason})", flush=True)
 
-        # 4. Groq LLM Generation
+        # 4. Groq LLM Generation with Rolling In-Meeting Memory
         llm_start = time.time()
-        messages: List[Dict[str, str]] = [
-            {"role": "system", "content": session.system_prompt},
-        ]
-        # Include any recent passively overheard room context
-        if session.recent_room_context:
-            ambient_summary = " | ".join(session.recent_room_context)
-            messages.append({
-                "role": "system",
-                "content": f"Recent background meeting context you passively heard: {ambient_summary}"
-            })
-        messages.extend(session.conversation_history[-8:])
+        follow_up_note: Optional[str] = None
         if gate_reason == "follow_up":
-            messages.append({
-                "role": "system",
-                "content": (
-                    "The next message did not say your name, but it came right after your last answer "
-                    "and looks like a follow-up question to you. Answer it naturally. Reply [SILENCE] "
-                    "only if it is clearly directed at another person."
-                )
-            })
-        messages.append({"role": "user", "content": user_text})
+            follow_up_note = (
+                "The next message did not say your name, but it came right after your last answer "
+                "and looks like a follow-up question to you. Answer it naturally. Reply [SILENCE] "
+                "only if it is clearly directed at another person."
+            )
+
+        messages = session.memory.build_llm_messages(
+            system_prompt=session.system_prompt,
+            current_user_text=user_text,
+            extra_system_note=follow_up_note,
+        )
         
         model_name = "qwen/qwen3.8-27b"
-        logger.info(f"🧠 [Turn #{turn_num}] Querying Groq LLM ({model_name})...")
+        logger.info(
+            f"🧠 [Turn #{turn_num}] Querying Groq LLM ({model_name}) "
+            f"with {session.memory.utterance_count} rolling utterances, {len(session.memory.qa_history)} Q&A msgs..."
+        )
         try:
             llm_resp = await client.chat.completions.create(
                 model=model_name,
@@ -383,20 +387,28 @@ class GroqVoicePipelineManager:
             raw_reply = (llm_resp.choices[0].message.content or "").strip()
             bot_reply = self._clean_for_speech(raw_reply)
 
-            # Honor explicit silence decision from system prompt
+            # Honor explicit silence decision from system prompt (still keep utterance in memory!)
             if not bot_reply or "[SILENCE]" in bot_reply.upper():
+                session.memory.add_room_utterance(user_text)
                 logger.info(f"🤫 [Turn #{turn_num}] LLM chose [SILENCE] ({llm_latency:.2f}s) for: \"{user_text}\"")
-                print(f"🤫 [GROQ QWEN LLM]   Staying silent ({llm_latency:.2f}s)", flush=True)
+                print(
+                    f"🤫 [GROQ QWEN LLM]   Staying silent ({llm_latency:.2f}s) "
+                    f"| 🧠 Memory: {session.memory.utterance_count} utterances",
+                    flush=True
+                )
                 print("=" * 60 + "\n", flush=True)
                 return
 
             logger.info(f"💡 [Turn #{turn_num}] Groq LLM reply ({llm_latency:.2f}s): \"{bot_reply}\"")
             print(f"🧠 [GROQ QWEN LLM]   {session.bot_name}: \"{bot_reply}\" ({llm_latency:.2f}s)", flush=True)
             
-            # Update history and clear consumed room context
-            session.recent_room_context.clear()
-            session.conversation_history.append({"role": "user", "content": user_text})
-            session.conversation_history.append({"role": "assistant", "content": bot_reply})
+            # Record exchange into rolling timeline + Q&A history (never wipes earlier meeting memory)
+            session.memory.add_exchange(user_text, bot_reply)
+            print(
+                f"🗂️ [MEETING MEMORY]  {session.memory.utterance_count} rolling utterances | "
+                f"{len(session.memory.qa_history)} Q&A msgs",
+                flush=True
+            )
         except Exception as llm_err:
             logger.error(f"❌ [Turn #{turn_num}] Groq LLM error: {llm_err}")
             print(f"❌ [GROQ LLM ERROR] {llm_err}", flush=True)
