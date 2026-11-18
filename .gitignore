@@ -13,3 +13,6 @@ wheels/
 .env
 .env.*
 !.env.example
+
+# Runtime state (voice session names for restart recovery)
+.runtime/

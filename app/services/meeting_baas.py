@@ -269,6 +269,8 @@ class MeetingBaaSClient:
         wake_phrases: list[str] | None = None
     ) -> BotResponseData:
         """Hosted fallback: Meeting BaaS Speaking Bots (Deepgram + GPT-4o-mini + Cartesia)."""
+        # Our own Groq bots must treat this one as another AI agent (not a human)
+        groq_voice_pipeline.register_ai_participant(bot_name)
         prompt = custom_prompt or load_system_prompt(bot_name=bot_name, include_silence_token=False)
         payload: dict = {
             "meeting_url": meeting_url,

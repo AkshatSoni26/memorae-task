@@ -1,4 +1,8 @@
 import asyncio
+import warnings
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    import audioop  # stdlib on Python 3.12 (resampling for STT uploads)
 import difflib
 import io
 import json
@@ -7,6 +11,7 @@ import re
 import struct
 import time
 import wave
+from pathlib import Path
 from typing import Dict, List, Optional
 from fastapi import WebSocket, WebSocketDisconnect
 from groq import AsyncGroq
@@ -105,6 +110,8 @@ class GroqVoicePipelineManager:
 
     def __init__(self):
         self.sessions: Dict[str, VoiceSession] = {}
+        self._http = None  # shared httpx.AsyncClient for Deepgram (keeps the TLS connection warm)
+        self.known_ai_names: set[str] = set()  # hosted Speaking Bots we dispatched (e.g. test bots)
         self.groq_client: Optional[AsyncGroq] = None
         
         # VAD Tuning Constants (at 24kHz mono 16-bit = 48,000 bytes/sec)
@@ -115,6 +122,11 @@ class GroqVoicePipelineManager:
         self.min_speech_bytes: int = 14400          # 0.30s min speech to avoid pops
         self.max_speech_bytes: int = 960000         # 20.0s max buffer cap (10s was cutting long sentences)
         self.follow_up_window_secs: float = 30.0    # Conversation mode idle timeout (same speaker)
+
+    def register_ai_participant(self, name: str) -> None:
+        """Marks a display name as an AI agent (used for bots we add via Speaking Bots)."""
+        if name and name.strip():
+            self.known_ai_names.add(name.strip().lower())
 
     def _get_client(self) -> AsyncGroq:
         if self.groq_client is None:
@@ -141,6 +153,53 @@ class GroqVoicePipelineManager:
         )
         self.sessions[session_id] = session
         logger.info(f"🎙️ Created Groq voice pipeline session: {session_id} for bot '{name}'")
+        if settings.speech_provider == "deepgram":
+            engines = f"STT: Deepgram {settings.deepgram_stt_model} | TTS: Deepgram {settings.deepgram_tts_model}"
+        else:
+            engines = "STT: Groq whisper-large-v3-turbo | TTS: Groq Orpheus"
+        print(f"🎛️ [ENGINES] USE_GROQ={settings.use_groq} -> {engines} | LLM: Groq qwen", flush=True)
+        if bot_name:
+            self._save_session_meta(session_id, {"bot_name": name, "entry_message": entry_message})
+        self._warm_up_tts()
+        return session
+
+    # Bot names survive a server restart (uvicorn --reload): Meeting BaaS reconnects the audio
+    # sockets with the same session id, and we rebuild the session under its real name.
+    SESSIONS_FILE: Path = Path(__file__).resolve().parents[2] / ".runtime" / "voice_sessions.json"
+
+    def _save_session_meta(self, session_id: str, meta: dict) -> None:
+        try:
+            data = json.loads(self.SESSIONS_FILE.read_text(encoding="utf-8")) if self.SESSIONS_FILE.exists() else {}
+            data[session_id] = {**data.get(session_id, {}), **meta, "saved_at": time.time()}
+            # keep only the last day of sessions
+            data = {k: v for k, v in data.items() if time.time() - v.get("saved_at", 0) < 86400}
+            self.SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self.SESSIONS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as save_err:
+            logger.warning(f"⚠️ Could not save voice session meta: {save_err}")
+
+    def restore_session(self, session_id: str) -> VoiceSession:
+        """Rebuilds a session after a server restart (same name / greeting); never re-greets."""
+        meta: dict = {}
+        try:
+            if self.SESSIONS_FILE.exists():
+                meta = json.loads(self.SESSIONS_FILE.read_text(encoding="utf-8")).get(session_id, {})
+        except Exception as load_err:
+            logger.warning(f"⚠️ Could not read voice session meta: {load_err}")
+        session = self.create_session(
+            session_id,
+            bot_name=meta.get("bot_name"),
+            entry_message=meta.get("entry_message"),
+        )
+        if meta.get("bot_id"):
+            self.sessions[meta["bot_id"]] = session
+            session.bot_id = meta["bot_id"]
+        session.greeted = True
+        print(
+            f"♻️ [RESTORE] Session {session_id} reconnected after restart as "
+            f"'{session.bot_name}'{'' if meta else ' (no saved name - using default)'}",
+            flush=True,
+        )
         return session
 
     def get_session(self, session_id: str) -> Optional[VoiceSession]:
@@ -151,6 +210,7 @@ class GroqVoicePipelineManager:
         if session_id in self.sessions:
             self.sessions[alias_id] = self.sessions[session_id]
             self.sessions[session_id].bot_id = alias_id
+            self._save_session_meta(session_id, {"bot_id": alias_id})
 
     def remove_session(self, key: str) -> None:
         """Drops a session and every alias pointing at it."""
@@ -258,6 +318,9 @@ class GroqVoicePipelineManager:
             is_direct = bool(
                 (words_only and (words_only[0] == bot_name_lower or words_only[-1] == bot_name_lower))
                 or re.search(rf"\b(?:hey|hi|hello|ok|okay|yo|thanks|thank you)\s*,?\s*{name_re}\b", sanitized_text)
+                # set off by commas / sentence punctuation: "So, Jarvis, ..." / "..., Jarvis."
+                or re.search(rf"(?:^|[,.!?;:]\s*){name_re}\s*(?:[,.!?;:]|$)", sanitized_text)
+                or re.search(rf"[,]\s*{name_re}\b", sanitized_text)
             )
             if is_ai_speaker:
                 if not is_direct:
@@ -341,7 +404,52 @@ class GroqVoicePipelineManager:
                 merged.append(part)
         return merged or [text]
 
+    DEEPGRAM_SPEAK_URL: str = "https://api.deepgram.com/v2/speak"
+
+    def _get_http(self):
+        """Shared HTTP client for Deepgram. Long keep-alive so each turn reuses the open TLS
+        connection instead of paying a fresh handshake (~1-2s from far regions)."""
+        import httpx
+        if self._http is None:
+            self._http = httpx.AsyncClient(
+                timeout=httpx.Timeout(20.0, connect=5.0),
+                limits=httpx.Limits(max_keepalive_connections=10, keepalive_expiry=300.0),
+            )
+        return self._http
+
+    async def _stream_deepgram(self, text: str):
+        """
+        Deepgram Flux voice (default flux-sienna-en) streamed as raw linear16 24kHz mono PCM.
+        Yields audio as it arrives (~0.5s to first byte), so playback starts immediately.
+        """
+        params = {
+            "model": settings.deepgram_tts_model,
+            "encoding": "linear16",
+            "sample_rate": "24000",
+            "container": "none",
+        }
+        async with self._get_http().stream(
+            "POST", self.DEEPGRAM_SPEAK_URL, params=params,
+            headers={"Authorization": f"Token {settings.deepgram_api_key}"},
+            json={"text": text},
+        ) as resp:
+            if resp.status_code != 200:
+                body = (await resp.aread()).decode("utf-8", "replace")[:200]
+                raise RuntimeError(f"Deepgram TTS error {resp.status_code}: {body}")
+            async for chunk in resp.aiter_bytes():
+                if chunk:
+                    yield chunk
+
     async def _synthesize_pcm(self, text: str) -> bytes:
+        """Whole-sentence PCM from the configured engine (USE_GROQ). No fallback."""
+        if settings.speech_provider == "deepgram":
+            pcm = b"".join([c async for c in self._stream_deepgram(text)])
+            if not pcm:
+                raise RuntimeError("Deepgram TTS returned no audio")
+            return pcm
+        return await self._synthesize_groq(text)
+
+    async def _synthesize_groq(self, text: str) -> bytes:
         tts_resp = await self._get_client().audio.speech.create(
             model="canopylabs/orpheus-v1-english",
             voice="autumn",
@@ -351,6 +459,24 @@ class GroqVoicePipelineManager:
         wav_bytes = await tts_resp.read()
         with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
             return wf.readframes(wf.getnframes())
+
+    def _warm_up_tts(self) -> None:
+        """Open the Deepgram connection when a bot is created so the first reply is not slow.
+        Never warms Groq (its free daily quota is tiny)."""
+        if settings.speech_provider != "deepgram":
+            return
+
+        async def warm() -> None:
+            try:
+                async for _ in self._stream_deepgram("Hi."):
+                    pass
+                print("🔈 [TTS] Deepgram text-to-speech warmed up", flush=True)
+            except Exception as warm_err:
+                logger.warning(f"⚠️ TTS warm-up (deepgram) failed: {warm_err}")
+        try:
+            asyncio.get_running_loop().create_task(warm())
+        except RuntimeError:
+            pass  # no running loop (sync context / tests)
 
     async def _wait_for_floor(self, session: VoiceSession) -> None:
         """Polite turn-taking: if someone else just started talking, give them up to 3s to finish."""
@@ -367,76 +493,116 @@ class GroqVoicePipelineManager:
             await asyncio.sleep(0.1)
             waited += 0.1
 
+    async def _produce_audio(self, text: str, queue: "asyncio.Queue") -> None:
+        """
+        Fills `queue` with PCM bytes for `text`, then None.
+        Deepgram: ONE streamed request for the whole reply, chunks forwarded as they arrive.
+        Groq: per-sentence synthesis, up to 3 sentences in flight (Orpheus has no streaming).
+        """
+        try:
+            if settings.speech_provider == "deepgram":
+                async for chunk in self._stream_deepgram(text):
+                    await queue.put(chunk)
+                return
+
+            sentences = self._split_sentences(text)
+            slots = asyncio.Semaphore(3)
+
+            async def synth(sentence_text: str) -> bytes:
+                async with slots:
+                    return await self._synthesize_groq(sentence_text)
+
+            tasks = [asyncio.create_task(synth(s)) for s in sentences]
+            try:
+                for task in tasks:
+                    await queue.put(await task)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+        except asyncio.CancelledError:
+            raise
+        except Exception as prod_err:
+            await queue.put(prod_err)
+        finally:
+            await queue.put(None)
+
     async def _speak_text_locked(self, session: VoiceSession, text: str) -> float:
         """
-        Pipelined TTS: all sentences are synthesized concurrently and playback starts as soon as
-        the FIRST sentence is ready. Waits for a free floor before speaking and stops if someone
-        talks over it (barge-in). Returns time-to-first-audio-ready (TTS latency) in seconds.
+        Streams the reply into the meeting as audio arrives. Waits for a free floor before speaking
+        and stops if someone talks over it (barge-in). Returns time-to-first-audio (TTS latency).
         """
-        sentences = self._split_sentences(text)
-        logger.info(f"🔊 [Groq TTS] Synthesizing {len(sentences)} sentence(s): \"{text}\"")
+        tts_label = (f"Deepgram {settings.deepgram_tts_model}" if settings.speech_provider == "deepgram"
+                     else "Groq Orpheus")
+        logger.info(f"🔊 [TTS: {tts_label}] Synthesizing: \"{text}\"")
         tts_start = time.time()
         tts_latency = 0.0
-        # At most 3 TTS requests in flight: keeps playback fed without tripping Groq rate limits
-        tts_slots = asyncio.Semaphore(3)
-
-        async def synth_limited(sentence_text: str) -> bytes:
-            async with tts_slots:
-                return await self._synthesize_pcm(sentence_text)
-
-        tasks = [asyncio.create_task(synth_limited(s)) for s in sentences]
+        queue: asyncio.Queue = asyncio.Queue()
+        producer = asyncio.create_task(self._produce_audio(text, queue))
+        chunk_size = self.chunk_size_bytes
+        buffer = b""
+        playback_started = 0.0
+        finished = False
 
         try:
-            playback_started = 0.0
-            for index, (sentence, task) in enumerate(zip(sentences, tasks)):
-                pcm_data = await task
-                if index == 0:
+            while True:
+                # Pull more audio whenever less than a full 20ms chunk is buffered
+                while not finished and len(buffer) < chunk_size:
+                    item = await queue.get()
+                    if item is None:
+                        finished = True
+                    elif isinstance(item, Exception):
+                        raise item
+                    else:
+                        buffer += item
+                if len(buffer) < 2:
+                    break
+
+                if not playback_started:
                     tts_latency = time.time() - tts_start
-                    print(f"🔊 [GROQ ORPHEUS TTS] First sentence ready in {tts_latency:.2f}s "
-                          f"({len(sentences)} sentence(s), pipelined)", flush=True)
+                    print(f"🔊 [TTS: {tts_label}] First audio ready in {tts_latency:.2f}s", flush=True)
                     await self._wait_for_floor(session)
                     session.is_speaking = True
                     playback_started = time.time()
                     print(f"▶️ [GOOGLE MEET] Speaking out loud to meeting: \"{text}\"", flush=True)
 
-                # Stream in 20ms chunks (960 bytes at 24kHz 16-bit mono). Always write to the
-                # *current* output socket so a mid-utterance reconnect keeps the audio going.
-                chunk_size = self.chunk_size_bytes
-                for offset in range(0, len(pcm_data), chunk_size):
-                    ws = session.out_websocket
-                    if ws is None:
-                        print(f"❌ [GOOGLE MEET] Output socket lost mid-speech - meeting did not hear: \"{sentence}\"", flush=True)
-                        return tts_latency
-                    # Barge-in: someone who started talking AFTER we began, for >= 1s -> yield
-                    interrupters = self._others_speaking(
-                        session, started_after=playback_started, min_secs=self.BARGE_IN_SECS
-                    )
-                    if interrupters:
-                        print(f"🛑 [BARGE-IN] {', '.join(interrupters)} started talking - stopping playback.", flush=True)
-                        return tts_latency
-                    await asyncio.wait_for(ws.send_bytes(pcm_data[offset:offset + chunk_size]), timeout=2.0)
-                    await asyncio.sleep(0.02)  # 20ms real-time pacing
+                # Always write to the *current* output socket so a mid-utterance reconnect keeps going
+                ws = session.out_websocket
+                if ws is None:
+                    print("❌ [GOOGLE MEET] Output socket lost mid-speech - meeting did not hear the rest.", flush=True)
+                    return tts_latency
+                # Barge-in: someone who started talking AFTER we began, for >= 1s -> yield
+                interrupters = self._others_speaking(
+                    session, started_after=playback_started, min_secs=self.BARGE_IN_SECS
+                )
+                if interrupters:
+                    print(f"🛑 [BARGE-IN] {', '.join(interrupters)} started talking - stopping playback.", flush=True)
+                    return tts_latency
+
+                take = chunk_size if len(buffer) >= chunk_size else len(buffer) - (len(buffer) % 2)
+                await asyncio.wait_for(ws.send_bytes(buffer[:take]), timeout=2.0)
+                buffer = buffer[take:]
+                await asyncio.sleep(0.02)  # 20ms real-time pacing
 
             logger.info(f"⏹️ Finished audio playback for: \"{text}\"")
-            print(f"⏹️ [GOOGLE MEET] Finished audio playback.", flush=True)
+            print("⏹️ [GOOGLE MEET] Finished audio playback.", flush=True)
             return tts_latency
         except Exception as e:
-            logger.error(f"❌ Error in Groq TTS playback: {e}")
-            print(f"❌ [GROQ TTS ERROR] {e}", flush=True)
+            logger.error(f"❌ Error in TTS playback: {e}")
+            print(f"❌ [TTS ERROR] {e}", flush=True)
             return tts_latency
         finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
+            if not producer.done():
+                producer.cancel()
             session.is_speaking = False
 
     async def process_turn(self, session: VoiceSession, pcm_bytes: bytes, speaker: str = "Participant") -> None:
         """
         Executes full voice turn:
-        1. Groq Whisper STT (whisper-large-v3-turbo)
+        1. STT: Deepgram Nova-3, or Groq Whisper when USE_GROQ=true
         2. Address check / Conversation context
         3. Groq Qwen LLM (qwen/qwen3.8-27b)
-        4. Groq Orpheus TTS (canopylabs/orpheus-v1-english)
+        4. TTS: Deepgram Flux (streamed), or Groq Orpheus when USE_GROQ=true
         5. Real-time audio stream to Google Meet
         """
         client = self._get_client()
@@ -444,36 +610,48 @@ class GroqVoicePipelineManager:
         turn_num = session.turns_count
         turn_start = time.time()
         
-        # 1. Package PCM into in-memory WAV for Whisper
+        # 1. Package PCM into an in-memory WAV, downsampled 24k -> 16k: speech recognizers work at
+        #    16 kHz anyway, and the upload is 1/3 smaller (measured ~3x faster Deepgram turns).
+        stt_rate = 16000
+        try:
+            stt_pcm = audioop.ratecv(pcm_bytes, session.sample_width, session.channels,
+                                     session.sample_rate, stt_rate, None)[0]
+        except Exception:
+            stt_pcm, stt_rate = pcm_bytes, session.sample_rate
         wav_buf = io.BytesIO()
         with wave.open(wav_buf, "wb") as wf:
             wf.setnchannels(session.channels)
             wf.setsampwidth(session.sample_width)
-            wf.setframerate(session.sample_rate)
-            wf.writeframes(pcm_bytes)
+            wf.setframerate(stt_rate)
+            wf.writeframes(stt_pcm)
         wav_payload = wav_buf.getvalue()
 
-        # 2. Whisper STT
+        # 2. Speech-to-text: Deepgram Nova-3 (with name keyterms), Groq Whisper as fallback
         stt_start = time.time()
-        logger.info(f"🎙️ [Turn #{turn_num}] Sending {len(wav_payload):,} audio bytes to Groq Whisper STT...")
+        logger.info(f"🎙️ [Turn #{turn_num}] Sending {len(wav_payload):,} audio bytes to STT...")
+        stt_engine = settings.speech_provider
         try:
-            stt_result = await client.audio.transcriptions.create(
-                file=("speech.wav", wav_payload, "audio/wav"),
-                model="whisper-large-v3-turbo",
-                language="en",
-                temperature=0.0,
-                prompt=self._stt_prompt(session),
-            )
-            stt_latency = time.time() - stt_start
-            user_text = stt_result.text.strip()
-            logger.info(f"📝 [Turn #{turn_num}] User said ({stt_latency:.2f}s): \"{user_text}\"")
-            print(f"\n" + "=" * 60, flush=True)
-            print(f"🎙️ [LIVE TURN #{turn_num}]", flush=True)
-            print(f"📝 [GROQ WHISPER STT] {speaker}: \"{user_text}\" ({stt_latency:.2f}s)", flush=True)
+            if stt_engine == "deepgram":
+                user_text = await self._transcribe_deepgram(session, wav_payload)
+            else:
+                stt_result = await client.audio.transcriptions.create(
+                    file=("speech.wav", wav_payload, "audio/wav"),
+                    model="whisper-large-v3-turbo",
+                    language="en",
+                    temperature=0.0,
+                    prompt=self._stt_prompt(session),
+                )
+                user_text = stt_result.text.strip()
         except Exception as stt_err:
-            logger.error(f"❌ [Turn #{turn_num}] Whisper STT error: {stt_err}")
-            print(f"❌ [GROQ STT ERROR] {stt_err}", flush=True)
+            logger.error(f"❌ [Turn #{turn_num}] {stt_engine} STT error: {stt_err}")
+            print(f"❌ [STT ERROR] {stt_engine}: {stt_err}", flush=True)
             return
+        stt_latency = time.time() - stt_start
+        label = "DEEPGRAM NOVA-3 STT" if stt_engine == "deepgram" else "GROQ WHISPER STT"
+        logger.info(f"📝 [Turn #{turn_num}] User said ({stt_latency:.2f}s, {stt_engine}): \"{user_text}\"")
+        print(f"\n" + "=" * 60, flush=True)
+        print(f"🎙️ [LIVE TURN #{turn_num}]", flush=True)
+        print(f"📝 [{label}] {speaker}: \"{user_text}\" ({stt_latency:.2f}s)", flush=True)
 
         normalized = re.sub(r"[^a-z ]", "", user_text.lower()).strip()
         if len(normalized) < 2 or normalized in self.WHISPER_HALLUCINATIONS:
@@ -631,7 +809,7 @@ class GroqVoicePipelineManager:
             print(f"❌ [GROQ LLM ERROR] {llm_err}", flush=True)
             return
 
-        # 5. Groq TTS Playback
+        # 5. TTS Playback
         tts_latency = await self.speak_text(session, bot_reply)
         session.last_bot_spoke_at = time.time()
         # Start/extend conversation mode with whoever we just answered
@@ -705,7 +883,47 @@ class GroqVoicePipelineManager:
     def _sibling_bot_names(self, session: VoiceSession) -> list[str]:
         """Display names of OTHER bots run by this server (they are AI participants too)."""
         names = {s.bot_name.strip() for s in self.sessions.values() if s is not session and s.bot_name}
-        return sorted(n for n in names if n.lower() != session.bot_name.lower().strip())
+        names |= {n for n in self.known_ai_names}
+        own = session.bot_name.lower().strip()
+        return sorted(n for n in names if n.lower() != own)
+
+    def _stt_keyterms(self, session: VoiceSession) -> list[str]:
+        """Names Deepgram should listen for: this bot, people and AIs in the call."""
+        names: list[str] = [session.bot_name.strip()]
+        for full in list(session.participant_names) + self._sibling_bot_names(session):
+            names.append(full)
+        names += ["Boardy", "Memorae", "Pau"]
+        seen: set[str] = set()
+        out: list[str] = []
+        for n in names:
+            key = n.lower().strip()
+            if n and key not in seen:
+                seen.add(key)
+                out.append(n.strip())
+        return out[:50]
+
+    async def _transcribe_deepgram(self, session: VoiceSession, wav_payload: bytes) -> str:
+        """Deepgram Nova-3 pre-recorded transcription of one speech segment."""
+        params: list[tuple[str, str]] = [
+            ("model", settings.deepgram_stt_model),
+            ("language", "en"),
+            ("smart_format", "true"),
+            ("punctuate", "true"),
+        ]
+        params += [("keyterm", k) for k in self._stt_keyterms(session)]
+        resp = await self._get_http().post(
+            "https://api.deepgram.com/v1/listen",
+            params=params,
+            headers={"Authorization": f"Token {settings.deepgram_api_key}", "Content-Type": "audio/wav"},
+            content=wav_payload,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Deepgram STT error {resp.status_code}: {resp.text[:200]}")
+        data = resp.json()
+        try:
+            return (data["results"]["channels"][0]["alternatives"][0]["transcript"] or "").strip()
+        except (KeyError, IndexError, TypeError):
+            raise RuntimeError(f"Deepgram STT unexpected response: {str(data)[:200]}")
 
     def _stt_prompt(self, session: VoiceSession) -> str:
         """

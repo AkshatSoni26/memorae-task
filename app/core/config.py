@@ -28,6 +28,14 @@ class Settings:
         self.llm_model: str = os.getenv("LLM_MODEL", "groq/qwen/qwen3.8-27b")
         self.llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.7"))
         self.llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "400"))
+        # Speech engines: USE_GROQ=true -> Groq Whisper STT + Groq Orpheus TTS.
+        # Otherwise -> Deepgram Nova-3 STT + Deepgram Flux TTS. No fallback between them.
+        # (The LLM is always Groq.)
+        self.use_groq: bool = os.getenv("USE_GROQ", "false").strip().lower() in ("1", "true", "yes", "on")
+        self.deepgram_api_key: str = os.getenv("DEEPGRAM_API_KEY", "")
+        self.deepgram_tts_model: str = os.getenv("DEEPGRAM_TTS_MODEL", "flux-sienna-en")
+        self.deepgram_stt_model: str = os.getenv("DEEPGRAM_STT_MODEL", "nova-3")
+        self.speech_provider: str = "groq" if self.use_groq else "deepgram"
 
         # Bot Persona & Behavior Defaults
         self.default_bot_name: str = os.getenv("DEFAULT_BOT_NAME", "Jarvis")
