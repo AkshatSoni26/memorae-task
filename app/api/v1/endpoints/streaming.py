@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from app.core.logger import logger
 from app.services.groq_voice_pipeline import groq_voice_pipeline
@@ -41,6 +42,7 @@ async def ws_audio_bidirectional(websocket: WebSocket, session_id: str):
         session = groq_voice_pipeline.create_session(session_id)
 
     session.out_websocket = websocket
-    if session.entry_message:
-        await groq_voice_pipeline.speak_text(session, session.entry_message)
+    asyncio.create_task(groq_voice_pipeline._greet_when_admitted(session))
     await groq_voice_pipeline.handle_audio_in(session, websocket)
+    if session.out_websocket is websocket:
+        session.out_websocket = None

@@ -1,3 +1,4 @@
+import os
 import requests
 import uuid
 from requests.exceptions import (
@@ -8,6 +9,7 @@ from requests.exceptions import (
 from app.core.config import settings
 from app.core.logger import logger
 from app.core.exceptions import (
+    MeetingServiceError,
     MeetingConfigurationError,
     MeetingProviderNetworkError,
     MeetingProviderResponseError,
@@ -33,7 +35,6 @@ def get_discovered_webhook_url() -> str | None:
     2. Queries live ngrok local API (http://127.0.0.1:4040/api/tunnels) for the currently running tunnel.
     3. Returns None if no public endpoint is running (never uses stale hardcoded domains).
     """
-    import os
     # 1. Environment variable override
     env_url = (
         os.getenv("WEBHOOK_URL")
@@ -66,11 +67,10 @@ def get_discovered_webhook_url() -> str | None:
     logger.warning("⚠️ No active public webhook URL found (ngrok not running on port 4040 and WEBHOOK_URL not set).")
     return None
 
-def get_discovered_ws_url() -> str:
+def get_discovered_ws_url() -> str | None:
     """
     Dynamically discovers the current active public WebSocket base URL (wss://...).
     """
-    import os
     # 1. Environment variable override
     env_url = (
         os.getenv("WS_URL")
@@ -110,7 +110,22 @@ def get_discovered_ws_url() -> str:
         except Exception:
             pass
 
-    return "wss://localhost:8000"
+    return None
+
+
+MEETING_BAAS_V2_BOTS_URL = "https://api.meetingbaas.com/v2/bots"
+
+
+def _provider_error_detail(resp: requests.Response) -> str:
+    """Extracts a human-readable error message from a Meeting BaaS error response."""
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            return str(body.get("message") or body.get("error") or body.get("detail") or body)
+    except ValueError:
+        pass
+    return resp.text[:500] or resp.reason
+
 
 class MeetingBaaSClient:
     def __init__(self):
@@ -125,7 +140,24 @@ class MeetingBaaSClient:
             logger.error("Meeting BaaS API key is missing")
             raise MeetingConfigurationError("MEETING_BAAS API key is not configured in .env")
 
+    def _post(self, url: str, payload: dict) -> requests.Response:
+        try:
+            return requests.post(url, json=payload, headers=self.headers, timeout=15)
+        except (Timeout, ReqConnectionError) as net_err:
+            logger.error(f"❌ Network failure calling {url}: {net_err}")
+            raise MeetingProviderNetworkError(f"Could not reach Meeting BaaS ({url}): {net_err}")
+        except RequestException as req_err:
+            logger.error(f"❌ HTTP request error calling {url}: {req_err}")
+            raise MeetingProviderNetworkError(f"HTTP request error: {req_err}")
+
+    # ------------------------------------------------------------------ dispatch
+
     def dispatch_bot(self, request: JoinMeetingRequest) -> BotResponseData:
+        """
+        Dispatches exactly the engine that was requested. No silent fallbacks: if the chosen
+        engine fails, the error is surfaced to the caller/UI instead of sending a different
+        (possibly mute) bot into the meeting.
+        """
         self._ensure_api_key()
         cleaned_url: str = sanitize_meeting_url(str(request.meeting_url))
 
@@ -136,109 +168,116 @@ class MeetingBaaSClient:
 
         bot_name: str = clean_val(request.bot_name, settings.default_bot_name)
         entry_message: str = clean_val(request.entry_message, settings.default_entry_message)
-        recording_mode: str = clean_val(request.recording_mode, settings.default_recording_mode)
+        custom_prompt: str = clean_val(request.prompt, "")
 
-        # Load system prompt from app/prompts/system_prompt.md (or honor explicit API override)
-        custom_prompt = clean_val(request.prompt, "")
-        groq_system_prompt: str = (
-            custom_prompt if custom_prompt
-            else load_system_prompt(bot_name=bot_name, include_silence_token=True)
-        )
-        speaking_system_prompt: str = (
-            custom_prompt if custom_prompt
-            else load_system_prompt(bot_name=bot_name, include_silence_token=False)
-        )
-
-        logger.info(f"🚀 Dispatching conversational agent '{bot_name}' to meeting: {cleaned_url}")
-
-        callback_url = None
+        callback_url: str | None
         if request.webhook_url and str(request.webhook_url).lower() != "https://example.com/":
             callback_url = str(request.webhook_url)
         else:
             callback_url = get_discovered_webhook_url()
 
         pipeline_mode = (request.pipeline_provider or "groq").lower().strip()
+        logger.info(f"🚀 Dispatching '{bot_name}' via engine '{pipeline_mode}' to meeting: {cleaned_url}")
 
-        # 1. Custom Groq Real-Time Voice Pipeline (Whisper STT + Qwen LLM + Orpheus TTS)
         if pipeline_mode == "groq":
-            session_id = str(uuid.uuid4())
-            groq_voice_pipeline.create_session(
-                session_id=session_id,
-                bot_name=bot_name,
-                system_prompt=groq_system_prompt,
-                entry_message=entry_message
+            return self._dispatch_groq(cleaned_url, bot_name, entry_message, custom_prompt, callback_url)
+        if pipeline_mode in ("speaking_bots", "speaking", "hosted"):
+            return self._dispatch_speaking_bot(cleaned_url, bot_name, entry_message, custom_prompt, callback_url)
+        raise MeetingServiceError(
+            f"Unknown pipeline_provider '{request.pipeline_provider}'. Use 'groq' or 'speaking_bots'.",
+            status_code=400
+        )
+
+    def _dispatch_groq(
+        self, meeting_url: str, bot_name: str, entry_message: str, custom_prompt: str, callback_url: str | None
+    ) -> BotResponseData:
+        """Custom pipeline: Meeting BaaS v2 bidirectional audio streaming + Groq STT/LLM/TTS."""
+        if not (settings.groq_api_key or os.getenv("GROQ_API_KEY")):
+            raise MeetingConfigurationError("GROQ_API_KEY is not configured in .env (required for the Groq engine)")
+
+        ws_base = get_discovered_ws_url()
+        if not ws_base:
+            raise MeetingConfigurationError(
+                "No public WSS endpoint found. Start `ngrok http 8000` (or set PUBLIC_URL) - "
+                "Meeting BaaS cannot stream audio to localhost."
             )
 
-            ws_base = get_discovered_ws_url()
-            output_url = f"{ws_base}/streaming/ws/audio-in/{session_id}"
-            input_url = f"{ws_base}/streaming/ws/audio-out/{session_id}"
+        session_id = str(uuid.uuid4())
+        system_prompt = custom_prompt or load_system_prompt(bot_name=bot_name, include_silence_token=True)
+        groq_voice_pipeline.create_session(
+            session_id=session_id,
+            bot_name=bot_name,
+            system_prompt=system_prompt,
+            entry_message=entry_message
+        )
 
-            logger.info(f"🎙️ Configured Groq Voice Pipeline WebSockets:\n   • output_url: {output_url}\n   • input_url:  {input_url}")
+        output_url = f"{ws_base}/streaming/ws/audio-in/{session_id}"
+        input_url = f"{ws_base}/streaming/ws/audio-out/{session_id}"
+        logger.info(f"🎙️ Groq pipeline WebSockets:\n   • output_url: {output_url}\n   • input_url:  {input_url}")
 
-            v2_bots_url = "https://api.meetingbaas.com/v2/bots"
-            payload_groq: dict = {
-                "meeting_url": cleaned_url,
-                "bot_name": bot_name,
-                "allow_multiple_bots": True,
-                "ignored_participant_names": ["Memorae", "Boardy"],
-                "streaming_enabled": True,
-                "streaming_config": {
-                    "mode": "audio",
-                    "output_url": output_url,
-                    "input_url": input_url,
-                    "audio_frequency": 24000
-                }
-            }
-            if callback_url:
-                payload_groq["callback_enabled"] = True
-                payload_groq["callback_config"] = {
-                    "url": callback_url,
-                    "method": "POST"
-                }
-
-            try:
-                logger.info(f"📡 Dispatching bot via Meeting BaaS v2 with Groq pipeline: {v2_bots_url}")
-                resp = requests.post(
-                    v2_bots_url,
-                    json=payload_groq,
-                    headers=self.headers,
-                    timeout=15
-                )
-                if resp.ok:
-                    resp_json = resp.json()
-                    bot_id_val = str(
-                        resp_json.get("data", {}).get("bot_id")
-                        or resp_json.get("bot_id")
-                        or session_id
-                    )
-                    session_store.register_bot(bot_id_val, cleaned_url, bot_name)
-                    session_store.update_status(bot_id_val, "in_call")
-                    # Map bot_id to the created voice session as well
-                    groq_voice_pipeline.sessions[bot_id_val] = groq_voice_pipeline.sessions[session_id]
-                    
-                    logger.info(f"✅ Bot '{bot_name}' dispatched successfully with Groq Voice Pipeline! Bot ID: {bot_id_val}")
-                    return BotResponseData(
-                        bot_id=bot_id_val,
-                        status=BotStatusEnum.JOINING,
-                        provider_endpoint=v2_bots_url,
-                        message=f"Bot '{bot_name}' successfully dispatched with Groq Voice Pipeline (Whisper + Qwen + Orpheus)."
-                    )
-                else:
-                    logger.warning(f"⚠️ Meeting BaaS v2 streaming dispatch returned {resp.status_code}: {resp.text}")
-            except (Timeout, ReqConnectionError) as net_err:
-                logger.warning(f"⚠️ Network error dispatching Groq streaming bot, falling back: {net_err}")
-
-        # 2. Speaking Bots API (OpenAI + Deepgram + Cartesia)
-        payload_speaking: dict = {
-            "meeting_url": cleaned_url,
+        payload: dict = {
+            "meeting_url": meeting_url,
             "bot_name": bot_name,
-            "prompt": speaking_system_prompt,
+            "allow_multiple_bots": True,
+            "ignored_participant_names": ["Memorae", "Boardy"],
+            "streaming_enabled": True,
+            "streaming_config": {
+                "mode": "audio",
+                "output_url": output_url,
+                "input_url": input_url,
+                "audio_frequency": 24000
+            }
+        }
+        if callback_url:
+            payload["callback_enabled"] = True
+            payload["callback_config"] = {"url": callback_url, "method": "POST"}
+
+        logger.info(f"📡 Dispatching bot via Meeting BaaS v2 streaming: {MEETING_BAAS_V2_BOTS_URL}")
+        try:
+            resp = self._post(MEETING_BAAS_V2_BOTS_URL, payload)
+        except MeetingServiceError:
+            groq_voice_pipeline.remove_session(session_id)
+            raise
+        if not resp.ok:
+            groq_voice_pipeline.remove_session(session_id)
+            detail = _provider_error_detail(resp)
+            logger.error(f"❌ Meeting BaaS v2 dispatch failed ({resp.status_code}): {detail}")
+            raise MeetingProviderResponseError(status_code=resp.status_code, detail=detail)
+
+        resp_json = resp.json()
+        bot_id_val = (resp_json.get("data") or {}).get("bot_id") or resp_json.get("bot_id")
+        if not bot_id_val:
+            groq_voice_pipeline.remove_session(session_id)
+            raise MeetingProviderResponseError(status_code=502, detail=f"No bot_id in provider response: {resp_json}")
+        bot_id_val = str(bot_id_val)
+
+        session_store.register_bot(bot_id_val, meeting_url, bot_name, engine="groq", voice_session_id=session_id)
+        groq_voice_pipeline.alias_session(bot_id_val, session_id)
+
+        logger.info(f"✅ Bot '{bot_name}' dispatched with Groq Voice Pipeline. Bot ID: {bot_id_val}")
+        return BotResponseData(
+            bot_id=bot_id_val,
+            status=BotStatusEnum.JOINING,
+            provider_endpoint=MEETING_BAAS_V2_BOTS_URL,
+            message=f"Bot '{bot_name}' dispatched with Groq Voice Pipeline (Whisper + Qwen + Orpheus)."
+        )
+
+    def _dispatch_speaking_bot(
+        self, meeting_url: str, bot_name: str, entry_message: str, custom_prompt: str, callback_url: str | None
+    ) -> BotResponseData:
+        """Hosted fallback: Meeting BaaS Speaking Bots (Deepgram + GPT-4o-mini + Cartesia)."""
+        prompt = custom_prompt or load_system_prompt(bot_name=bot_name, include_silence_token=False)
+        payload: dict = {
+            "meeting_url": meeting_url,
+            "bot_name": bot_name,
+            "prompt": prompt,
             "personas": ["helpful_assistant"],
             "llm_provider": "openai",
             "llm_model": "gpt-4o-mini",
             "entry_message": entry_message,
             "enable_tools": False,
-            "respond_mode": "always",
+            # 'mentioned': only replies shortly after someone says its name (multi-party mode).
+            "respond_mode": "mentioned",
             "turn_config": {
                 "stop_secs": 0.4,
                 "unfinished_pause_secs": 0.8
@@ -246,78 +285,34 @@ class MeetingBaaSClient:
             "briefing": {}
         }
         if callback_url:
-            payload_speaking["callback_url"] = callback_url
+            payload["callback_url"] = callback_url
 
-        try:
-            logger.info(f"📡 Sending request to Speaking Bots API: {settings.speaking_api_url}")
-            resp = requests.post(
-                settings.speaking_api_url,
-                json=payload_speaking,
-                headers=self.headers,
-                timeout=15
-            )
-            if resp.ok:
-                resp_json = resp.json()
-                bot_id_val = str(resp_json.get("bot_id") or resp_json.get("id") or resp_json)
-                session_store.register_bot(bot_id_val, cleaned_url, bot_name)
-                session_store.update_status(bot_id_val, "in_call")
-                logger.info(f"✅ Bot '{bot_name}' dispatched successfully via Speaking Bots API! Bot ID: {bot_id_val}")
-                return BotResponseData(
-                    bot_id=bot_id_val,
-                    status=BotStatusEnum.JOINING,
-                    provider_endpoint=settings.speaking_api_url,
-                    message=f"Bot '{bot_name}' successfully dispatched via Speaking Bots API."
-                )
-            else:
-                logger.warning(f"⚠️ Speaking Bots API returned status {resp.status_code}: {resp.text}")
-        except (Timeout, ReqConnectionError) as net_err:
-            logger.warning(f"⚠️ Speaking Bots network error, falling back to standard API: {net_err}")
+        logger.info(f"📡 Sending request to Speaking Bots API: {settings.speaking_api_url}")
+        resp = self._post(settings.speaking_api_url, payload)
+        if not resp.ok:
+            detail = _provider_error_detail(resp)
+            logger.error(f"❌ Speaking Bots dispatch failed ({resp.status_code}): {detail}")
+            raise MeetingProviderResponseError(status_code=resp.status_code, detail=detail)
 
-        # Fallback to standard Meeting BaaS v2 API
-        logger.info(f"📡 Falling back to standard Meeting BaaS v2 API: {settings.baas_api_url}")
-        payload_v2: dict[str, str] = {
-            "meeting_url": cleaned_url,
-            "bot_name": bot_name,
-            "recording_mode": recording_mode,
-            "entry_message": entry_message,
-        }
-        if request.webhook_url and str(request.webhook_url).lower() != "https://example.com/":
-            payload_v2["webhook_url"] = str(request.webhook_url)
+        resp_json = resp.json()
+        bot_id_val = resp_json.get("bot_id") or resp_json.get("id") or (resp_json.get("data") or {}).get("bot_id")
+        if not bot_id_val:
+            raise MeetingProviderResponseError(status_code=502, detail=f"No bot_id in provider response: {resp_json}")
+        bot_id_val = str(bot_id_val)
 
-        try:
-            resp = requests.post(
-                settings.baas_api_url,
-                json=payload_v2,
-                headers=self.headers,
-                timeout=15
-            )
-            if resp.ok:
-                resp_json = resp.json()
-                bot_id_val = str(resp_json.get("bot_id") or resp_json.get("id") or resp_json)
-                session_store.register_bot(bot_id_val, cleaned_url, bot_name)
-                logger.info(f"✅ Bot '{bot_name}' dispatched via Meeting BaaS v2 API. Bot ID: {bot_id_val}")
-                return BotResponseData(
-                    bot_id=bot_id_val,
-                    status=BotStatusEnum.JOINING,
-                    provider_endpoint=settings.baas_api_url,
-                    message=f"Bot '{bot_name}' successfully dispatched via Meeting BaaS v2 API."
-                )
-            logger.error(f"❌ Meeting BaaS v2 API error ({resp.status_code}): {resp.text}")
-            raise MeetingProviderResponseError(
-                status_code=resp.status_code,
-                detail=resp.text
-            )
-        except (Timeout, ReqConnectionError) as net_err:
-            logger.error(f"❌ Network failure dispatching bot: {net_err}")
-            raise MeetingProviderNetworkError(f"Connection timeout or network failure: {str(net_err)}")
-        except RequestException as req_err:
-            logger.error(f"❌ HTTP request error: {req_err}")
-            raise MeetingProviderNetworkError(f"HTTP request error: {str(req_err)}")
+        session_store.register_bot(bot_id_val, meeting_url, bot_name, engine="speaking_bots")
+        logger.info(f"✅ Bot '{bot_name}' dispatched via Speaking Bots API. Bot ID: {bot_id_val}")
+        return BotResponseData(
+            bot_id=bot_id_val,
+            status=BotStatusEnum.JOINING,
+            provider_endpoint=settings.speaking_api_url,
+            message=f"Bot '{bot_name}' dispatched via hosted Speaking Bots API."
+        )
+
+    # ------------------------------------------------------------------ status
 
     def get_bot_usage(self, bot_id: str) -> dict | None:
-        """
-        Retrieves live pipeline diagnostic metrics (audio seconds, turns, TTS plays)
-        """
+        """Retrieves live Speaking Bots pipeline metrics (audio seconds, turns, TTS plays)."""
         url = f"{settings.speaking_api_url}/{bot_id}/usage"
         try:
             resp = requests.get(url, headers=self.headers, timeout=5)
@@ -328,74 +323,75 @@ class MeetingBaaSClient:
         return None
 
     def get_status(self, bot_id: str) -> BotStatusResponse:
+        """
+        Returns the normalized app status (creating / joining / waiting_for_admission /
+        in_call / ended / failed). Webhooks are the primary source (they carry the waiting-room
+        state); for Groq/v2 bots the v2 status endpoint is polled as a backup.
+        """
         self._ensure_api_key()
+        cached = session_store.get_bot(bot_id)
+        if cached is None:
+            raise BotNotFoundError(bot_id)
 
-        cached_session = session_store.get_bot(bot_id)
-        current_status = cached_session.get("status", "joining") if cached_session else "joining"
-        meeting_url = cached_session.get("meeting_url") if cached_session else None
+        if cached.get("engine") == "groq" and cached.get("status") not in ("ended", "failed"):
+            url = f"{MEETING_BAAS_V2_BOTS_URL}/{bot_id}/status"
+            try:
+                resp = requests.get(url, headers={"x-meeting-baas-api-key": self.api_key}, timeout=5)
+                if resp.ok:
+                    raw = (resp.json().get("data") or {}).get("status")
+                    session_store.update_status(bot_id, raw)
+                else:
+                    logger.debug(f"v2 status check returned {resp.status_code}: {resp.text[:200]}")
+            except RequestException as net_err:
+                logger.debug(f"Upstream status check unavailable: {net_err}")
 
-        url = f"{settings.baas_api_url}/{bot_id}"
-        try:
-            resp = requests.get(url, headers={"x-meeting-baas-api-key": self.api_key}, timeout=5)
-            if resp.ok:
-                res = resp.json()
-                raw_data = res.get("data", res)
-                current_status = raw_data.get("status", current_status)
-        except (Timeout, ReqConnectionError, RequestException) as net_err:
-            logger.debug(f"Upstream status check skipped/unavailable: {net_err}")
-
-        status_data = BotStatusData(
-            bot_id=bot_id,
-            status=current_status,
-            meeting_url=meeting_url
-        )
+        cached = session_store.get_bot(bot_id) or {}
+        current_status = cached.get("status", "joining")
+        extra: dict[str, str] = {"engine": str(cached.get("engine") or "")}
+        if cached.get("raw_status"):
+            extra["provider_status"] = str(cached["raw_status"])
+        if cached.get("error"):
+            extra["error"] = str(cached["error"])
 
         return BotStatusResponse(
             bot_id=bot_id,
             status=current_status,
-            data=status_data
+            data=BotStatusData(bot_id=bot_id, status=current_status, meeting_url=cached.get("meeting_url")),
+            extra_details=extra
         )
 
-    def leave_meeting(self, bot_id: str) -> BotLeaveResponse:
-        self._ensure_api_key()
-        
-        # 1. Speaking Bots API requires a JSON body: {"bot_id": "..."}
-        speaking_delete_url = f"{settings.speaking_api_url}/{bot_id}"
-        logger.info(f"🛑 Sending leave request to Speaking Bots: {speaking_delete_url}")
-        try:
-            resp = requests.delete(
-                speaking_delete_url,
-                headers=self.headers,
-                json={"bot_id": bot_id},
-                timeout=10
-            )
-            if resp.ok or resp.status_code in (200, 202, 204):
-                session_store.update_status(bot_id, "ended")
-                logger.info(f"✅ Bot {bot_id} leave request successful via Speaking Bots API.")
-                return BotLeaveResponse(
-                    bot_id=bot_id,
-                    message=f"Bot {bot_id} has left the meeting.",
-                    success=True
-                )
-            else:
-                logger.warning(f"Speaking Bots delete status {resp.status_code}: {resp.text}")
-        except (Timeout, ReqConnectionError, RequestException) as net_err:
-            logger.warning(f"Speaking Bots delete network issue, trying fallback: {net_err}")
+    # ------------------------------------------------------------------ leave
 
-        # 2. Fallback to standard baas API
-        url = f"{settings.baas_api_url}/{bot_id}"
+    def leave_meeting(self, bot_id: str) -> BotLeaveResponse:
+        """Removes the bot using the endpoint that matches the engine it was created with."""
+        self._ensure_api_key()
+        cached = session_store.get_bot(bot_id) or {}
+        engine = cached.get("engine", "groq")
+
         try:
-            resp = requests.delete(url, headers=self.headers, timeout=10)
-            session_store.update_status(bot_id, "ended")
-            logger.info(f"✅ Bot {bot_id} leave request completed.")
-            return BotLeaveResponse(
-                bot_id=bot_id,
-                message=f"Bot {bot_id} has been instructed to leave the meeting.",
-                success=True
-            )
+            if engine == "speaking_bots":
+                url = f"{settings.speaking_api_url}/{bot_id}"
+                logger.info(f"🛑 Removing Speaking Bot: DELETE {url}")
+                resp = requests.delete(url, headers=self.headers, json={"bot_id": bot_id}, timeout=10)
+            else:
+                url = f"{MEETING_BAAS_V2_BOTS_URL}/{bot_id}/leave"
+                logger.info(f"🛑 Removing v2 bot: POST {url}")
+                resp = requests.post(url, headers={"x-meeting-baas-api-key": self.api_key}, timeout=10)
         except (Timeout, ReqConnectionError) as net_err:
-            raise MeetingProviderNetworkError(f"Connection timeout sending leave request: {str(net_err)}")
+            raise MeetingProviderNetworkError(f"Connection timeout sending leave request: {net_err}")
         except RequestException as req_err:
-            raise MeetingProviderNetworkError(f"HTTP error sending leave request: {str(req_err)}")
+            raise MeetingProviderNetworkError(f"HTTP error sending leave request: {req_err}")
+
+        if not resp.ok:
+            detail = _provider_error_detail(resp)
+            logger.error(f"❌ Leave request failed for bot {bot_id} ({resp.status_code}): {detail}")
+            raise MeetingProviderResponseError(status_code=resp.status_code, detail=detail)
+
+        session_store.update_status(bot_id, "ended")
+        if cached.get("voice_session_id"):
+            groq_voice_pipeline.remove_session(cached["voice_session_id"])
+        groq_voice_pipeline.remove_session(bot_id)
+        logger.info(f"✅ Bot {bot_id} left the meeting.")
+        return BotLeaveResponse(bot_id=bot_id, message=f"Bot {bot_id} has left the meeting.", success=True)
 
 meeting_baas_service = MeetingBaaSClient()

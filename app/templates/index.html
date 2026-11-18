@@ -249,10 +249,10 @@
       const st = (status || "").toLowerCase();
       badge.innerText = st.replace(/_/g, ' ').toUpperCase();
 
-      if (['in_call', 'in_call_recording', 'active'].includes(st)) {
+      if (st === 'in_call') {
         badge.className = "px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30";
         document.getElementById('statusNotice').classList.add('hidden');
-      } else if (['ended', 'call_ended', 'failed', 'bot_rejected'].includes(st)) {
+      } else if (['ended', 'failed'].includes(st)) {
         badge.className = "px-2.5 py-0.5 rounded-full text-xs font-semibold bg-rose-500/20 text-rose-300 border border-rose-500/30";
       } else {
         badge.className = "px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30 status-pulse";
@@ -268,8 +268,17 @@
             const data = await resp.json();
             if (data.status) {
               updateBadge(data.status);
-              if (['call_ended', 'ended', 'failed', 'bot_rejected'].includes(data.status.toLowerCase())) {
+              const st = data.status.toLowerCase();
+              const extra = data.extra_details || {};
+              if (st === 'waiting_for_admission') {
+                showAlert("Agent is in the waiting room - click 'Admit' in Google Meet.");
+              }
+              if (['ended', 'failed'].includes(st)) {
                 clearInterval(pollTimer);
+                if (st === 'failed') {
+                  const why = extra.error || extra.provider_status || 'unknown reason';
+                  showAlert(`Agent failed to join: ${why}`, true);
+                }
                 resetUI();
               }
             }

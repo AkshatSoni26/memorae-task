@@ -5,6 +5,7 @@ from pydantic import BaseModel, HttpUrl
 class BotStatusEnum(str, Enum):
     CREATING = "creating"
     JOINING = "joining"
+    WAITING_FOR_ADMISSION = "waiting_for_admission"
     IN_WAITING_ROOM = "in_waiting_room"
     IN_CALL = "in_call"
     RECORDING = "recording"

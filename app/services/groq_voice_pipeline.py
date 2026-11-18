@@ -41,7 +41,15 @@ class VoiceSession:
         self.speech_bytes: int = 0
         self.frames_received: int = 0
         self.lock: asyncio.Lock = asyncio.Lock()
-        
+        # Serializes reply generation + playback so two turns never talk over each other
+        self.turn_lock: asyncio.Lock = asyncio.Lock()
+        # Serializes writes to the outbound audio socket (greeting vs. replies)
+        self.speak_lock: asyncio.Lock = asyncio.Lock()
+
+        # Provider bot_id (set once dispatch returns) and one-time greeting flag
+        self.bot_id: Optional[str] = None
+        self.greeted: bool = False
+
         # Diagnostics
         self.turns_count: int = 0
         self.total_speech_secs: float = 0.0
@@ -53,6 +61,17 @@ class GroqVoicePipelineManager:
         "ok", "okay", "k", "thanks", "thank you", "cool", "nice", "great",
         "got it", "yeah", "yes", "yep", "nope", "alright", "all right",
         "uh-huh", "mm-hmm", "hmm", "right", "sure", "awesome", "perfect",
+    })
+    # Phrases Whisper commonly invents from noise/silence; never treat them as real speech
+    WHISPER_HALLUCINATIONS: frozenset[str] = frozenset({
+        "you", "thank you", "thanks", "thank you so much", "thanks for watching",
+        "thank you for watching", "bye", "bye bye", "uh", "um", "hmm", "so",
+    })
+    # Openers that make an un-named utterance look like a question/request to the bot
+    QUESTION_STARTERS: frozenset[str] = frozenset({
+        "what", "why", "how", "when", "where", "who", "whom", "whose", "which",
+        "can", "could", "would", "should", "will", "is", "are", "was", "were",
+        "do", "does", "did", "have", "has", "tell", "explain", "give", "say",
     })
 
     def __init__(self):
@@ -98,6 +117,32 @@ class GroqVoicePipelineManager:
     def get_session(self, session_id: str) -> Optional[VoiceSession]:
         return self.sessions.get(session_id)
 
+    def alias_session(self, alias_id: str, session_id: str) -> None:
+        """Makes a session reachable by a second key (e.g. the provider bot_id)."""
+        if session_id in self.sessions:
+            self.sessions[alias_id] = self.sessions[session_id]
+            self.sessions[session_id].bot_id = alias_id
+
+    def remove_session(self, key: str) -> None:
+        """Drops a session and every alias pointing at it."""
+        session = self.sessions.get(key)
+        if session is None:
+            return
+        for k in [k for k, v in self.sessions.items() if v is session]:
+            del self.sessions[k]
+        logger.info(f"🧹 Removed voice session {session.session_id}")
+
+    def _looks_like_follow_up(self, text_lower: str) -> bool:
+        """Heuristic: is this a question/request plausibly continuing the bot's last answer?"""
+        stripped = text_lower.strip().rstrip(".!")
+        if not stripped or stripped in self.BACKCHANNEL_PHRASES:
+            return False
+        if stripped.endswith("?"):
+            return True
+        stripped = re.sub(r"^(?:and|so|but|okay|ok|alright|then)\b[,\s]*", "", stripped)
+        words = stripped.split()
+        return bool(words) and words[0].strip(",") in self.QUESTION_STARTERS
+
     @staticmethod
     def _clean_for_speech(text: str) -> str:
         """
@@ -114,7 +159,8 @@ class GroqVoicePipelineManager:
         Strict explicit-address gate:
         - ONLY responds when a participant explicitly calls this bot by its exact name.
         - Blocks 'Memorae' / 'Memo ray' / 'Boardy' collisions.
-        - Ignores all other speech (even right after replying) and saves it as passive context.
+        - Within follow_up_window_secs after the bot spoke, also accepts un-named questions.
+        - Ignores all other speech and saves it as passive context.
         """
         text_lower = user_text.lower().strip()
         bot_name_lower = session.bot_name.lower().strip()
@@ -138,6 +184,15 @@ class GroqVoicePipelineManager:
             if re.search(other_pattern, sanitized_text):
                 return False, "other_bot_addressed"
 
+        # Follow-up window: shortly after the bot answered, a question without the name
+        # is most likely aimed at the bot. The LLM still gets a final [SILENCE] veto.
+        if (
+            session.last_bot_spoke_at
+            and time.time() - session.last_bot_spoke_at <= self.follow_up_window_secs
+            and self._looks_like_follow_up(sanitized_text)
+        ):
+            return True, "follow_up"
+
         return False, "not_explicitly_addressed"
 
     @staticmethod
@@ -159,9 +214,13 @@ class GroqVoicePipelineManager:
         Returns TTS synthesis latency in seconds (0.0 on failure).
         """
         if not session.out_websocket:
-            logger.warning(f"⚠️ Cannot speak: out_websocket not connected for session {session.session_id}")
+            print(f"❌ [GOOGLE MEET] Cannot speak - no output socket connected (session {session.session_id})", flush=True)
             return 0.0
 
+        async with session.speak_lock:
+            return await self._speak_text_locked(session, text)
+
+    async def _speak_text_locked(self, session: VoiceSession, text: str) -> float:
         client = self._get_client()
         logger.info(f"🔊 [Groq TTS] Synthesizing speech for: \"{text}\"")
         tts_start = time.time()
@@ -187,12 +246,16 @@ class GroqVoicePipelineManager:
             logger.info(f"▶️ Streaming {len(pcm_data):,} PCM bytes to Google Meet audio output...")
             print(f"▶️ [GOOGLE MEET] Speaking out loud to meeting: \"{text}\"", flush=True)
             
-            # Stream in 20ms chunks (960 bytes at 24kHz 16-bit mono)
+            # Stream in 20ms chunks (960 bytes at 24kHz 16-bit mono). Always write to the
+            # *current* output socket so a mid-utterance reconnect keeps the audio going.
             chunk_size = self.chunk_size_bytes
             for offset in range(0, len(pcm_data), chunk_size):
                 chunk = pcm_data[offset:offset + chunk_size]
-                if session.out_websocket:
-                    await session.out_websocket.send_bytes(chunk)
+                ws = session.out_websocket
+                if ws is None:
+                    print(f"❌ [GOOGLE MEET] Output socket lost mid-speech - meeting did not hear: \"{text}\"", flush=True)
+                    return tts_latency
+                await asyncio.wait_for(ws.send_bytes(chunk), timeout=2.0)
                 await asyncio.sleep(0.02)  # 20ms real-time pacing
 
             logger.info(f"⏹️ Finished audio playback for: \"{text}\"")
@@ -249,9 +312,22 @@ class GroqVoicePipelineManager:
             print(f"❌ [GROQ STT ERROR] {stt_err}", flush=True)
             return
 
-        if not user_text or len(user_text) < 2:
-            logger.debug(f"🔇 [Turn #{turn_num}] Ignoring blank or noise transcription.")
+        normalized = re.sub(r"[^a-z ]", "", user_text.lower()).strip()
+        if len(normalized) < 2 or normalized in self.WHISPER_HALLUCINATIONS:
+            print(f"🔇 [Turn #{turn_num}] Ignored noise / Whisper hallucination: \"{user_text}\"", flush=True)
             return
+
+        # Steps 3-5 run under the per-session turn lock: if turns pile up while the bot is
+        # thinking or talking, they are answered one at a time instead of overlapping audio.
+        if session.turn_lock.locked():
+            print(f"⏳ [Turn #{turn_num}] Waiting for previous reply to finish...", flush=True)
+        async with session.turn_lock:
+            await self._respond_to_turn(session, turn_num, user_text, stt_latency, turn_start)
+
+    async def _respond_to_turn(
+        self, session: VoiceSession, turn_num: int, user_text: str, stt_latency: float, turn_start: float
+    ) -> None:
+        client = self._get_client()
 
         # 3. Multi-bot safe addressing gate
         is_addressed, gate_reason = self._evaluate_addressing(session, user_text)
@@ -283,6 +359,15 @@ class GroqVoicePipelineManager:
                 "content": f"Recent background meeting context you passively heard: {ambient_summary}"
             })
         messages.extend(session.conversation_history[-8:])
+        if gate_reason == "follow_up":
+            messages.append({
+                "role": "system",
+                "content": (
+                    "The next message did not say your name, but it came right after your last answer "
+                    "and looks like a follow-up question to you. Answer it naturally. Reply [SILENCE] "
+                    "only if it is clearly directed at another person."
+                )
+            })
         messages.append({"role": "user", "content": user_text})
         
         model_name = "qwen/qwen3.8-27b"
@@ -342,7 +427,8 @@ class GroqVoicePipelineManager:
         session.in_websocket = websocket
         logger.info(f"🎧 Inbound audio stream connected for session {session.session_id}")
         print(f"\n🎧 [TERMINAL] Google Meet Audio Stream Connected! Session: {session.session_id}", flush=True)
-        
+        hb_started, hb_frames, hb_peak = time.time(), 0, 0.0
+
         try:
             while True:
                 message = await websocket.receive()
@@ -358,15 +444,26 @@ class GroqVoicePipelineManager:
                     continue
                 
                 session.frames_received += 1
+                rms = self._calculate_rms(data)
                 if session.frames_received == 1:
-                    rms_first = self._calculate_rms(data)
-                    print(f"🎵 [TERMINAL] First audio packet received from Google Meet! ({len(data)} bytes, RMS: {rms_first:.0f})", flush=True)
-                
+                    print(f"🎵 [TERMINAL] First audio packet received from Google Meet! ({len(data)} bytes, RMS: {rms:.0f})", flush=True)
+
+                # Heartbeat every 10s so "bot can't hear" is diagnosable from the terminal
+                hb_frames += 1
+                hb_peak = max(hb_peak, rms)
+                if time.time() - hb_started >= 10.0:
+                    print(
+                        f"🎚️ [AUDIO-IN] {hb_frames} packets in last 10s | peak RMS {hb_peak:.0f} "
+                        f"(speech threshold {self.silence_threshold_rms:.0f}) | bot speaking: {session.is_speaking} "
+                        f"| output socket: {'OK' if session.out_websocket else 'MISSING'}",
+                        flush=True
+                    )
+                    hb_started, hb_frames, hb_peak = time.time(), 0, 0.0
+
                 # If bot is currently speaking, mute/ignore mic audio to prevent acoustic echo
                 if session.is_speaking:
                     continue
 
-                rms = self._calculate_rms(data)
                 is_speech = rms > self.silence_threshold_rms
 
                 async with session.lock:
@@ -409,11 +506,14 @@ class GroqVoicePipelineManager:
                             session.silence_bytes = 0
 
         except WebSocketDisconnect:
-            logger.info(f"🔌 Inbound audio stream disconnected for session {session.session_id}")
+            pass
         except Exception as e:
             logger.error(f"❌ Exception in inbound audio stream: {e}")
         finally:
-            session.in_websocket = None
+            if session.in_websocket is websocket:
+                session.in_websocket = None
+            print(f"🔌 [TERMINAL] Audio INPUT socket closed (session {session.session_id}); "
+                  f"active input socket remaining: {session.in_websocket is not None}", flush=True)
 
     async def handle_audio_out(self, session: VoiceSession, websocket: WebSocket) -> None:
         """
@@ -424,11 +524,10 @@ class GroqVoicePipelineManager:
         logger.info(f"📢 Outbound audio stream connected for session {session.session_id}")
         print(f"\n📢 [TERMINAL] Google Meet Audio Output Connected! Bot microphone active.", flush=True)
         
-        # Deliver entry greeting speech into the meeting call
-        if session.entry_message:
-            await asyncio.sleep(0.5)  # brief pause for audio stream stabilization
-            await self.speak_text(session, session.entry_message)
-            
+        # Greet once per session, only after the bot is admitted (runs in background so the
+        # socket keeps being serviced while we wait in the waiting room).
+        greet_task = asyncio.create_task(self._greet_when_admitted(session))
+
         try:
             # Keep socket open and listen for any peer pings/events
             while True:
@@ -436,10 +535,54 @@ class GroqVoicePipelineManager:
                 if msg.get("type") == "websocket.disconnect":
                     break
         except WebSocketDisconnect:
-            logger.info(f"🔌 Outbound audio stream disconnected for session {session.session_id}")
+            pass
         except Exception as e:
             logger.error(f"❌ Exception in outbound audio stream: {e}")
         finally:
-            session.out_websocket = None
+            # Only clear the reference if it still points at THIS socket. Meeting BaaS reconnects
+            # streams (e.g. after admission); the old socket closing must not kill the new one.
+            if session.out_websocket is websocket:
+                session.out_websocket = None
+            print(f"🔌 [TERMINAL] Audio OUTPUT socket closed (session {session.session_id}); "
+                  f"active output socket remaining: {session.out_websocket is not None}", flush=True)
+            if not greet_task.done() and session.out_websocket is None:
+                greet_task.cancel()
+
+    async def _wait_until_admitted(self, session: VoiceSession, timeout_secs: float = 180.0) -> bool:
+        """Polls the provider status until the bot is in the call. Returns False if it ended/failed."""
+        if not session.bot_id:
+            return True  # ad-hoc session without a known bot: don't block the greeting
+        from app.services.meeting_baas import meeting_baas_service  # local import: avoid cycle
+
+        deadline = time.time() + timeout_secs
+        announced = False
+        while time.time() < deadline:
+            try:
+                status = (await asyncio.to_thread(meeting_baas_service.get_status, session.bot_id)).status
+            except Exception as e:
+                logger.debug(f"Status check failed while waiting for admission: {e}")
+                status = None
+            if status == "in_call":
+                return True
+            if status in ("ended", "failed"):
+                return False
+            if not announced:
+                print(f"⏳ [TERMINAL] Bot not admitted yet (status: {status}) - greeting will play once it's in the call.", flush=True)
+                announced = True
+            await asyncio.sleep(1.5)
+        logger.warning("⚠️ Timed out waiting for admission status; greeting anyway.")
+        return True
+
+    async def _greet_when_admitted(self, session: VoiceSession) -> None:
+        if session.greeted or not session.entry_message:
+            return
+        if not await self._wait_until_admitted(session):
+            return
+        await asyncio.sleep(1.0)  # let the meeting audio path settle after admission
+        # Check-and-set with no await in between: two concurrent handlers can't both greet.
+        if session.greeted or not session.out_websocket:
+            return
+        session.greeted = True
+        await self.speak_text(session, session.entry_message)
 
 groq_voice_pipeline = GroqVoicePipelineManager()

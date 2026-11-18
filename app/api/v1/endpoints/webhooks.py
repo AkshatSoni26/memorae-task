@@ -6,6 +6,8 @@ from app.core.logger import logger
 
 router = APIRouter(tags=["Webhooks"])
 
+# Meeting BaaS also delivers account-level webhooks to the tunnel root ("POST /"); accept both.
+@router.post("/", include_in_schema=False)
 @router.post(
     "/webhook",
     response_model=WebhookAckResponse,
@@ -42,19 +44,25 @@ async def handle_meeting_baas_webhook(request: Request):
         speaker = data.get("speaker", "Participant")
         print(f"👤 [{speaker.upper()} SPOKE]: \"{transcript_data}\"")
 
-    # 3. Status transitions
+    # 3. Status transitions (normalized to creating/joining/waiting_for_admission/in_call/ended/failed)
     status_obj = data.get("status")
-    current_status = None
+    raw_status = None
+    error_message = None
     if isinstance(status_obj, dict):
-        current_status = status_obj.get("code")
-        print(f"📊 [STATUS]: {current_status}")
-        if status_obj.get("error_message"):
-            print(f"❌ [ERROR]: {status_obj.get('error_message')}")
-        session_store.update_status(bot_id, current_status)
+        raw_status = status_obj.get("code")
+        error_message = status_obj.get("error_message")
     elif isinstance(status_obj, str):
-        current_status = status_obj
-        print(f"📊 [STATUS]: {current_status}")
-        session_store.update_status(bot_id, current_status)
+        raw_status = status_obj
+    elif event in ("bot.completed", "bot.failed"):
+        raw_status = event
+    error_message = error_message or data.get("error_message") or data.get("error")
+
+    current_status = None
+    if raw_status:
+        current_status = session_store.update_status(bot_id, raw_status, error=error_message)
+        print(f"📊 [STATUS]: {raw_status} -> {current_status}")
+    if error_message:
+        print(f"❌ [ERROR]: {error_message}")
 
     # 4. In-meeting chat messages
     if "message" in data:

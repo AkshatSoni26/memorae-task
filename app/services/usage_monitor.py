@@ -18,7 +18,7 @@ async def poll_active_bots_usage():
     while True:
         try:
             latest_session = session_store.get_latest_bot()
-            if latest_session and latest_session.get("status") in ["joining", "in_call", "in_call_recording"]:
+            if latest_session and latest_session.get("status") in ["joining", "waiting_for_admission", "in_call"]:
                 bot_id = latest_session.get("bot_id")
                 
                 # 1. Check Groq Voice Pipeline session
