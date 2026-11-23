@@ -1,122 +1,144 @@
-# Memorae — Real-Time Google Meet AI Agent
+# Real-Time Google Meet AI Agent
 
-A conversational AI meeting participant designed to join a Google Meet call, listen in real time, and respond when addressed.
+An AI participant that joins a Google Meet, listens in real time, and talks like a person in the room. It speaks only when it's addressed, handles follow-up questions, stays quiet when people are just talking about it, and remembers everything said in the meeting.
+
+![System architecture](docs/architecture.svg)
+
+Full write-up: [docs/architecture.md](docs/architecture.md)
 
 ---
 
-## ⚡ Quick Start: Live Demo Runbook
+## What it does
 
-Follow these exact steps whenever you restart or present the live demo:
+- **Joins a Google Meet** from a web UI or the CLI, waits to be admitted, then greets the room.
+- **Knows when it's being spoken to.** It answers when called by name (including names the transcriber gets slightly wrong) and handles follow-up questions without the name. It stays silent when people only mention it or talk to each other.
+- **Takes turns like a person.** It waits for the speaker to finish (0.75 s pause), holds its reply while someone else is talking, and stops mid-sentence if someone talks over it.
+- **Remembers the meeting.** A full transcript, keyword recall of older lines, and running notes (people, facts, action items, summary) written in the background by a small model, so replies never wait on it.
+- **Works with other AI agents** (e.g. Boardy) in the same call, with a guard that stops bot-to-bot loops.
+- **Survives a server restart** mid-call: session metadata and notes persist in `.runtime/`.
 
-### 1. Start the FastAPI Server
-Open your primary terminal and run:
+## Stack
+
+| Stage | Default | Alternative (`USE_GROQ=true`) |
+|---|---|---|
+| Meeting bridge | Meeting BaaS v2 (live 24 kHz PCM over WebSockets) | Meeting BaaS hosted Speaking Bot (GPT-4o-mini + Cartesia), selectable in the UI |
+| Speech-to-text | Deepgram Nova-3 | Groq Whisper `whisper-large-v3-turbo` |
+| LLM | Qwen `qwen/qwen3.8-27b` on Groq | same |
+| Text-to-speech | Deepgram Flux, streamed | Groq Orpheus |
+| Meeting notes | `openai/gpt-oss-20b` on Groq | same |
+| Backend | FastAPI + Uvicorn, Python 3.12, `uv` | |
+
+---
+
+## Quick start
+
+### 1. Install and configure
+
 ```bash
-uv run uvicorn main:app --reload --port 8000
+uv sync
+cp .env.example .env   # then fill in your keys
 ```
-- Web UI: [http://localhost:8000/](http://localhost:8000/)
-- Swagger Docs: [http://localhost:8000/docs](http://localhost:8000/docs)
-- Health Check: [http://localhost:8000/health](http://localhost:8000/health)
 
----
+You need keys for **Meeting BaaS**, **Groq** and **Deepgram** (Deepgram isn't needed if `USE_GROQ=true`), plus [ngrok](https://ngrok.com/) installed.
 
-### 2. Start ngrok Tunnel (For Webhooks)
-Open a second terminal and run:
+### 2. Start the server
+
 ```bash
-ngrok http 8000
+make server          # or: uv run uvicorn main:app --reload --port 8000
 ```
-> **✨ Zero-Config Auto-Discovery:**  
-> You don't need to manually copy or paste your ngrok URL anywhere! The backend automatically detects your active ngrok tunnel via the local daemon API (`http://127.0.0.1:4040/api/tunnels`) on every dispatch and registers it dynamically with the bot engine.
 
----
+- Web UI: http://localhost:8000/
+- API docs: http://localhost:8000/docs
+- Health check: http://localhost:8000/health
 
-### 3. Join the Google Meet Call
+### 3. Start ngrok (second terminal)
 
-You can trigger the bot in either of two ways:
-
-#### Option A: Web Interface (Recommended for Demo)
-1. Open [http://localhost:8000/](http://localhost:8000/) in your browser.
-2. Paste your Google Meet URL (e.g., `https://meet.google.com/xxx-yyyy-zzz`).
-3. Click **"Send Agent to Call"**.
-4. In Google Meet, click **"Admit"** when the agent requests to join.
-5. Listen for the greeting, speak to the bot, and click **"Leave Call"** when finished.
-
-#### Option B: Terminal CLI
 ```bash
-uv run python cli.py https://meet.google.com/xxx-yyyy-zzz
+make ngrok           # or: ngrok http 8000
 ```
-- Press `s` to view live status and participant counts.
-- Press `q` to disconnect the bot and exit.
+
+You don't need to copy the ngrok URL anywhere. The backend reads it from ngrok's local API (`127.0.0.1:4040`) every time it sends a bot. On Windows, `make dev` opens ngrok in a new window and starts the server in one step.
+
+### 4. Send the agent to a call
+
+**Web UI:** open http://localhost:8000/, paste the Meet link, click **Send Agent to Call**, then **Admit** the agent in Google Meet.
+
+**CLI:**
+
+```bash
+make cli URL=https://meet.google.com/xxx-yyyy-zzz
+```
+
+Press `s` for live status and `q` to make the bot leave.
+
+Then talk to it by name, e.g. *"Jarvis, what did we decide about the launch date?"*
 
 ---
 
-## 🛠️ Configuration (`.env`)
+## Configuration (`.env`)
 
-Your `.env` file controls all keys and personas:
+See [`.env.example`](.env.example) for every option. The main ones:
 
-```env
-# Meeting BaaS Credentials
-MEETING_BAAS=your_meeting_baas_api_key
-MEETING_BAAS_WEBHOOK=your_webhook_secret
+| Variable | Purpose |
+|---|---|
+| `MEETING_BAAS`, `MEETING_BAAS_WEBHOOK` | Meeting BaaS API key and webhook secret |
+| `GROQ_API_KEY` | LLM and meeting notes (also speech when `USE_GROQ=true`) |
+| `DEEPGRAM_API_KEY` | Speech-to-text and text-to-speech (default engines) |
+| `USE_GROQ` | `false` = Deepgram speech (default), `true` = Groq Whisper + Orpheus |
+| `DEFAULT_BOT_NAME`, `DEFAULT_ENTRY_MESSAGE` | Agent name and greeting (can also be set per call in the UI) |
+| `OTHER_AI_PARTICIPANTS` | Other AI agents in the call, e.g. `Memorae,Boardy` |
+| `BOT_NAME_ALIASES` | Extra spellings of the bot's name the transcriber may produce |
+| `MEMORY_NOTES_ENABLED`, `MEMORY_NOTES_MODEL` | Background meeting notes |
+| `WEBHOOK_URL` | Optional fixed public URL; leave blank for ngrok auto-discovery |
 
-# AI Brain & LLM (LiteLLM with Groq)
-GROQ_API_KEY=gsk_your_groq_api_key
-LLM_MODEL=groq/qwen/qwen3.8-27b
-LLM_TEMPERATURE=0.7
-LLM_MAX_TOKENS=150
-
-# Agent Persona
-DEFAULT_BOT_NAME=Akshat
-DEFAULT_ENTRY_MESSAGE="Hey everyone, Akshat here. Glad to join."
-DEFAULT_BOT_PROMPT="You are Akshat, a friendly software engineer participating in a Google Meet. You listen carefully and only speak when someone asks you a question or directly addresses you. Keep answers very concise, punchy, conversational, and direct (1-2 sentences). Do not introduce yourself repeatedly. Do not interrupt other participants."
-DEFAULT_RECORDING_MODE=speaker_view
-```
+The agent's personality and rules live in [`app/prompts/system_prompt.md`](app/prompts/system_prompt.md). Context about the meeting (who built it, who's in the call) goes in [`app/prompts/briefing.md`](app/prompts/briefing.md). Both are re-read at the start of every session, so you don't need to restart after editing them.
 
 ---
 
-## 📂 Project Structure
+## Project structure
 
 ```text
 memorsa-task/
 ├── app/
-│   ├── api/
-│   │   └── v1/
-│   │       ├── endpoints/
-│   │       │   ├── bots.py          # /join, /status, /leave endpoints
-│   │       │   └── webhooks.py      # /webhook real-time callback logger
-│   │       └── router.py            # API router aggregation
-│   ├── core/
-│   │   ├── config.py                # Pydantic BaseSettings & environment loader
-│   │   ├── exceptions.py            # Custom typed error hierarchy
-│   │   └── logger.py                # Structured terminal logger
-│   ├── helpers/
-│   │   └── meeting.py               # Google Meet URL cleaner & code extractor
-│   ├── models/
-│   │   ├── bot.py                   # Domain models & BotStatusEnum
-│   │   └── __init__.py
-│   ├── schemas/
-│   │   ├── bot.py                   # Request & response validation schemas
-│   │   └── webhook.py               # Webhook payload & ACK schemas
+│   ├── api/v1/
+│   │   ├── endpoints/
+│   │   │   ├── bots.py            # POST /bots/join, GET + DELETE /bots/{bot_id}
+│   │   │   ├── streaming.py       # audio-in / audio-out WebSockets
+│   │   │   └── webhooks.py        # Meeting BaaS status webhooks
+│   │   └── router.py
+│   ├── core/                      # config (.env), logger, typed exceptions
+│   ├── helpers/meeting.py         # Google Meet URL cleaning
+│   ├── models/, schemas/          # Pydantic models and request/response schemas
+│   ├── prompts/
+│   │   ├── system_prompt.md       # personality, spoken style, turn-taking rules
+│   │   ├── briefing.md            # meeting-specific context
+│   │   └── loader.py
 │   ├── services/
-│   │   ├── agent.py                 # LiteLLM Groq agent brain & turn-taking gate
-│   │   ├── meeting_baas.py          # Speaking Bots & v2 API bridge
-│   │   └── session_store.py         # In-memory live session state
-│   └── templates/
-│       └── index.html               # Single-page UI for live demo
-├── cli.py                           # Standalone interactive CLI
-├── main.py                          # FastAPI application entrypoint
-├── pyproject.toml                   # UV dependencies & project configuration
-└── README.md                        # Documentation & setup guide
+│   │   ├── voice/                 # real-time voice pipeline
+│   │   │   ├── stream_handler.py  #   audio in/out, turn detection, greeting
+│   │   │   ├── turn_handler.py    #   one turn: STT -> gate -> LLM -> TTS
+│   │   │   ├── stt.py             #   Deepgram / Groq Whisper
+│   │   │   ├── addressing.py      #   "is it talking to me?" gate
+│   │   │   ├── llm.py             #   Qwen on Groq
+│   │   │   ├── tts.py             #   Deepgram Flux / Groq Orpheus, barge-in
+│   │   │   ├── memory_notes.py    #   background meeting notes
+│   │   │   └── session*.py        #   per-call state, restart recovery
+│   │   ├── meeting_memory.py      # transcript, recall, notes -> LLM context
+│   │   ├── meeting_baas.py        # Meeting BaaS API (join, status, leave)
+│   │   ├── groq_voice_pipeline.py # facade used by the API layer
+│   │   ├── session_store.py       # live bot status
+│   │   └── usage_monitor.py       # background status/usage logging
+│   └── templates/index.html       # web UI
+├── docs/                          # architecture write-up and diagram
+├── cli.py                         # terminal client
+├── main.py                        # FastAPI entrypoint
+└── Makefile
 ```
 
 ---
 
-## 🔍 Architecture & Live Demo Talking Points
+## Next steps for production
 
-If Pau asks how this was built and structured:
-1. **Media Transport Layer (Google Meet WebRTC):**
-   - Headless WebRTC browser execution is handled via Meeting BaaS Speaking Bots API.
-2. **AI Agent Brain (FastAPI + LiteLLM + Groq):**
-   - High-speed inference using `groq/qwen/qwen3.8-27b` for sub-250ms conversational response time.
-   - Intelligent addressing filter prevents the bot from talking over other participants.
-3. **Real-Time Observability (Webhooks):**
-   - Direct callback ingestion at `/webhook` for live session tracking and terminal logs.
+- **Lower latency:** stream speech-to-text and the LLM end to end, and join meetings faster (Recall AI or a custom meeting bot).
+- **Persistent memory:** Postgres + pgvector or mem0, so the agent remembers people across meetings.
+- **Actions:** tools for reminders and follow-ups.
