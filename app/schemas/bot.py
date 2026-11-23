@@ -43,7 +43,7 @@ class JoinMeetingRequest(BaseModel):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "meeting_url": "https://meet.google.com/caa-aadv-tyx",
+                "meeting_url": "https://meet.google.com/kui-cmxo-xab",
                 "bot_name": settings.default_bot_name
             }
         }
