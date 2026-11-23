@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 920" width="1400" height="920" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5eead4"/></marker>
+    <marker id="ab" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#818cf8"/></marker>
+    <marker id="ap" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#c084fc"/></marker>
+    <marker id="ao" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#fb923c"/></marker>
+  </defs>
+  <style>
+    .t  { fill:#f1f5f9; font-size:20px; font-weight:600; }
+    .h  { fill:#f1f5f9; font-size:16px; font-weight:600; }
+    .s  { fill:#94a3b8; font-size:12.5px; }
+    .m  { fill:#94a3b8; font-size:12px; font-family:ui-monospace, Consolas, monospace; }
+    .n  { fill:#0f172a; font-size:13px; font-weight:700; }
+    .lb { fill:#94a3b8; font-size:12px; }
+  </style>
+
+  <rect width="1400" height="920" fill="#0b1020"/>
+  <text x="40" y="52" fill="#f8fafc" font-size="26" font-weight="700">Real-Time Google Meet Voice Agent</text>
+  <text x="40" y="78" class="s">Meeting BaaS streams live call audio to a FastAPI backend; a custom pipeline decides when the agent is addressed, answers with meeting memory, and speaks back into the call.</text>
+
+  <!-- Control layer -->
+  <rect x="40" y="110" width="400" height="210" rx="14" fill="#141a33" stroke="#4f46e5" stroke-opacity=".6"/>
+  <text x="240" y="142" text-anchor="middle" class="t">Control Layer</text>
+  <rect x="70" y="160" width="340" height="56" rx="10" fill="#1e2350" stroke="#818cf8"/>
+  <text x="240" y="184" text-anchor="middle" class="h">Web UI &amp; CLI</text>
+  <text x="240" y="203" text-anchor="middle" class="s">Meet link, agent name, greeting, engine choice</text>
+  <line x1="240" y1="216" x2="240" y2="240" stroke="#818cf8" stroke-width="2" marker-end="url(#ab)"/>
+  <rect x="70" y="242" width="340" height="62" rx="10" fill="#1e2350" stroke="#818cf8"/>
+  <text x="240" y="266" text-anchor="middle" class="h">FastAPI Backend</text>
+  <text x="240" y="285" text-anchor="middle" class="m">/api/v1/bots · /streaming/ws · /webhook</text>
+
+  <!-- ngrok -->
+  <rect x="470" y="160" width="250" height="144" rx="12" fill="#121826" stroke="#334155"/>
+  <text x="595" y="190" text-anchor="middle" class="h">ngrok tunnel</text>
+  <text x="595" y="214" text-anchor="middle" class="s">Public HTTPS (webhooks)</text>
+  <text x="595" y="233" text-anchor="middle" class="s">and WSS (live audio)</text>
+  <text x="595" y="262" text-anchor="middle" class="s">URL auto-discovered from</text>
+  <text x="595" y="280" text-anchor="middle" class="m">127.0.0.1:4040</text>
+  <line x1="410" y1="273" x2="466" y2="273" stroke="#818cf8" stroke-width="2" marker-end="url(#ab)"/>
+
+  <!-- Meeting bridge -->
+  <rect x="40" y="360" width="400" height="190" rx="14" fill="#0f1e33" stroke="#3b82f6" stroke-opacity=".7"/>
+  <text x="240" y="392" text-anchor="middle" class="t">Meeting Bridge</text>
+  <rect x="62" y="410" width="140" height="120" rx="10" fill="#132a46" stroke="#60a5fa"/>
+  <text x="132" y="464" text-anchor="middle" class="h">Google Meet</text>
+  <text x="132" y="484" text-anchor="middle" class="s">live call</text>
+  <line x1="204" y1="455" x2="244" y2="455" stroke="#60a5fa" stroke-width="2" marker-end="url(#ab)"/>
+  <line x1="244" y1="485" x2="204" y2="485" stroke="#60a5fa" stroke-width="2" marker-end="url(#ab)"/>
+  <rect x="246" y="410" width="174" height="120" rx="10" fill="#132a46" stroke="#60a5fa"/>
+  <text x="333" y="440" text-anchor="middle" class="h">Meeting BaaS v2</text>
+  <text x="333" y="462" text-anchor="middle" class="s">Bot joins the call</text>
+  <text x="333" y="480" text-anchor="middle" class="s">24 kHz 16-bit PCM</text>
+  <text x="333" y="498" text-anchor="middle" class="s">+ who-is-speaking events</text>
+  <line x1="240" y1="304" x2="240" y2="356" stroke="#818cf8" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#ab)"/>
+  <text x="250" y="336" class="lb">join / status / leave</text>
+
+  <!-- Pipeline -->
+  <rect x="490" y="345" width="870" height="290" rx="16" fill="#0d1f1d" stroke="#2dd4bf" stroke-opacity=".7"/>
+  <text x="925" y="377" text-anchor="middle" class="t">Custom Real-Time Voice Pipeline  ·  app/services/voice/</text>
+
+  <!-- steps: x = 510, 680, 850, 1020, 1190 ; w=150 -->
+  <g>
+    <rect x="510" y="400" width="150" height="150" rx="12" fill="#10302c" stroke="#5eead4"/>
+    <circle cx="585" cy="400" r="14" fill="#5eead4"/><text x="585" y="405" text-anchor="middle" class="n">1</text>
+    <text x="585" y="436" text-anchor="middle" class="h">Turn Detection</text>
+    <text x="585" y="460" text-anchor="middle" class="s">RMS voice activity</text>
+    <text x="585" y="478" text-anchor="middle" class="s">0.75 s end-of-turn pause</text>
+    <text x="585" y="496" text-anchor="middle" class="s">tags each turn with</text>
+    <text x="585" y="514" text-anchor="middle" class="s">the active speaker</text>
+  </g>
+  <line x1="662" y1="475" x2="678" y2="475" stroke="#5eead4" stroke-width="2" marker-end="url(#ag)"/>
+  <g>
+    <rect x="680" y="400" width="150" height="150" rx="12" fill="#10302c" stroke="#5eead4"/>
+    <circle cx="755" cy="400" r="14" fill="#5eead4"/><text x="755" y="405" text-anchor="middle" class="n">2</text>
+    <text x="755" y="436" text-anchor="middle" class="h">Speech-to-Text</text>
+    <text x="755" y="460" text-anchor="middle" class="s">Deepgram Nova-3</text>
+    <text x="755" y="478" text-anchor="middle" class="s">(or Groq Whisper)</text>
+    <text x="755" y="500" text-anchor="middle" class="s">participant names sent</text>
+    <text x="755" y="518" text-anchor="middle" class="s">as key terms</text>
+  </g>
+  <line x1="832" y1="475" x2="848" y2="475" stroke="#5eead4" stroke-width="2" marker-end="url(#ag)"/>
+  <g>
+    <rect x="850" y="400" width="150" height="150" rx="12" fill="#2b2410" stroke="#fbbf24"/>
+    <circle cx="925" cy="400" r="14" fill="#fbbf24"/><text x="925" y="405" text-anchor="middle" class="n">3</text>
+    <text x="925" y="436" text-anchor="middle" class="h">Addressing Gate</text>
+    <text x="925" y="460" text-anchor="middle" class="s">name + misheard name</text>
+    <text x="925" y="478" text-anchor="middle" class="s">follow-ups in a convo</text>
+    <text x="925" y="496" text-anchor="middle" class="s">skips talk to other bots</text>
+    <text x="925" y="514" text-anchor="middle" class="s">bot-to-bot loop guard</text>
+  </g>
+  <line x1="1002" y1="475" x2="1018" y2="475" stroke="#fbbf24" stroke-width="2" marker-end="url(#ao)"/>
+  <g>
+    <rect x="1020" y="400" width="150" height="150" rx="12" fill="#2d1a0e" stroke="#fb923c"/>
+    <circle cx="1095" cy="400" r="14" fill="#fb923c"/><text x="1095" y="405" text-anchor="middle" class="n">4</text>
+    <text x="1095" y="436" text-anchor="middle" class="h">LLM on Groq</text>
+    <text x="1095" y="460" text-anchor="middle" class="m">qwen3.8-27b</text>
+    <text x="1095" y="482" text-anchor="middle" class="s">system prompt</text>
+    <text x="1095" y="500" text-anchor="middle" class="s">+ briefing</text>
+    <text x="1095" y="518" text-anchor="middle" class="s">+ meeting memory</text>
+  </g>
+  <line x1="1172" y1="475" x2="1188" y2="475" stroke="#fb923c" stroke-width="2" marker-end="url(#ao)"/>
+  <g>
+    <rect x="1190" y="400" width="150" height="150" rx="12" fill="#2d1a0e" stroke="#fb923c"/>
+    <circle cx="1265" cy="400" r="14" fill="#fb923c"/><text x="1265" y="405" text-anchor="middle" class="n">5</text>
+    <text x="1265" y="436" text-anchor="middle" class="h">Text-to-Speech</text>
+    <text x="1265" y="460" text-anchor="middle" class="s">Deepgram Flux, streamed</text>
+    <text x="1265" y="478" text-anchor="middle" class="s">(or Groq Orpheus)</text>
+    <text x="1265" y="500" text-anchor="middle" class="s">waits for a gap; stops</text>
+    <text x="1265" y="518" text-anchor="middle" class="s">if someone talks over</text>
+  </g>
+  
+
+  <!-- audio in / out arrows -->
+  <path d="M420,440 L470,440 L470,475 L506,475" fill="none" stroke="#5eead4" stroke-width="2" marker-end="url(#ag)"/>
+  <text x="446" y="430" class="m">audio-in</text>
+  <path d="M1265,552 L1265,620 L470,620 L470,505 L424,505" fill="none" stroke="#fb923c" stroke-width="2" marker-end="url(#ao)"/>
+  <text x="478" y="600" class="m">audio-out</text>
+
+  <!-- Memory -->
+  <rect x="490" y="670" width="870" height="150" rx="16" fill="#1b1230" stroke="#c084fc" stroke-opacity=".8"/>
+  <text x="520" y="702" class="t">Meeting Memory</text>
+  <text x="520" y="722" class="m">app/services/meeting_memory.py · voice/memory_notes.py</text>
+  <rect x="520" y="738" width="250" height="66" rx="10" fill="#26183f" stroke="#c084fc"/>
+  <text x="645" y="762" text-anchor="middle" class="h">Transcript</text>
+  <text x="645" y="782" text-anchor="middle" class="s">every line, incl. unaddressed talk</text>
+  <rect x="795" y="738" width="250" height="66" rx="10" fill="#26183f" stroke="#c084fc"/>
+  <text x="920" y="762" text-anchor="middle" class="h">Keyword Recall</text>
+  <text x="920" y="782" text-anchor="middle" class="s">older lines matching the question</text>
+  <rect x="1070" y="738" width="270" height="66" rx="10" fill="#26183f" stroke="#c084fc"/>
+  <text x="1205" y="762" text-anchor="middle" class="h">Background Notes</text>
+  <text x="1205" y="782" text-anchor="middle" class="s">people · facts · to-dos · summary</text>
+  <text x="1205" y="798" text-anchor="middle" class="m">gpt-oss-20b · saved to .runtime/</text>
+  <path d="M925,552 L925,580 L880,580 L880,666" fill="none" stroke="#c084fc" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#ap)"/>
+  <text x="872" y="652" text-anchor="end" class="lb">every line stored</text>
+  <path d="M1120,666 L1120,580 L1095,580 L1095,554" fill="none" stroke="#c084fc" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#ap)"/>
+  <text x="1128" y="652" class="lb">context for each reply</text>
+
+  <!-- Fallback + observability -->
+  <rect x="40" y="670" width="400" height="70" rx="12" fill="#161026" stroke="#a78bfa" stroke-dasharray="6 5"/>
+  <text x="240" y="698" text-anchor="middle" class="h">Fallback: Hosted Speaking Bot</text>
+  <text x="240" y="720" text-anchor="middle" class="s">Meeting BaaS-hosted · GPT-4o-mini + Cartesia</text>
+  <rect x="40" y="750" width="400" height="70" rx="12" fill="#1f1a0d" stroke="#f59e0b" stroke-opacity=".8"/>
+  <text x="240" y="778" text-anchor="middle" class="h">Observability</text>
+  <text x="240" y="800" text-anchor="middle" class="s">Webhook status · live transcript · gate decisions · latency</text>
+
+  <text x="40" y="866" class="s">Restart-safe: session metadata and notes persist in .runtime/, so a server restart mid-call resumes the same agent.</text>
+  <text x="40" y="892" class="s">Speech engines are one switch: USE_GROQ=false → Deepgram Nova-3 + Flux (default) · USE_GROQ=true → Groq Whisper + Orpheus. The LLM is always Qwen on Groq.</text>
+</svg>
