@@ -1,5 +1,5 @@
 [project]
-name = "memorsa-task"
+name = "memorae-task"
 version = "0.1.0"
 description = "Real-time AI voice agent that joins Google Meet calls"
 readme = "README.md"

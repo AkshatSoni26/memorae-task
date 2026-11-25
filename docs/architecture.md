@@ -1,6 +1,35 @@
 # Real-Time Google Meet Voice Agent: Architecture
 
-![System architecture](./architecture.svg)
+```mermaid
+flowchart TB
+    UI["Web UI / CLI"] --> API["FastAPI backend<br/>/api/v1/bots · /webhook<br/>ngrok URL auto-discovered"]
+    API -. "join / status / leave" .-> BAAS
+    MEET["Google Meet"] <--> BAAS["Meeting BaaS v2<br/>24 kHz PCM + speaker events"]
+
+    subgraph pipeline["Voice pipeline (app/services/voice)"]
+        direction LR
+        VAD["1 · Turn detection<br/>RMS voice activity<br/>0.75 s end-of-turn pause"]
+        STT["2 · Speech-to-text<br/>Deepgram Nova-3<br/>or Groq Whisper"]
+        GATE{"3 · Addressed?"}
+        LLM["4 · LLM<br/>Qwen 3.8 27B on Groq"]
+        TTS["5 · Text-to-speech<br/>Deepgram Flux or Groq Orpheus<br/>waits for a gap, stops if talked over"]
+        VAD --> STT --> GATE
+        GATE -- yes --> LLM --> TTS
+    end
+
+    subgraph memory["Meeting memory"]
+        direction LR
+        TRANSCRIPT["Transcript<br/>every line, answered or not"]
+        RECALL["Keyword recall<br/>older matching lines"]
+        NOTES["Background notes<br/>people · facts · to-dos · summary<br/>gpt-oss-20b"]
+        TRANSCRIPT --> NOTES
+    end
+
+    BAAS -- "audio-in (WSS)" --> VAD
+    TTS -- "audio-out (WSS)" --> BAAS
+    GATE -- "no: stay silent, keep the line" --> TRANSCRIPT
+    memory -. "context for each reply" .-> LLM
+```
 
 An AI participant that joins a Google Meet, listens in real time, speaks only when it is addressed, and remembers everything said in the meeting.
 
